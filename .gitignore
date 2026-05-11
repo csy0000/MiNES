@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+data/
+*.DS_Store
+simulations/cpp/neq_sim

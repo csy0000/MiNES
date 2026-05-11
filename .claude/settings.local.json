@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('scripts/mines_variance_fusion.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python3 -c ' *)",
+      "Bash(python -m py_compile /Users/shuyuchen/Dropbox/ETH/Work/MiNES/scripts/mines_variance_fusion.py)"
+    ]
+  }
+}

@@ -1,0 +1,16 @@
+name: MiNES
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - matplotlib
+  - jupyterlab
+  - notebook
+  - ipykernel
+  - pip
+  - pandas
+  - pip:
+      - pymbar
+

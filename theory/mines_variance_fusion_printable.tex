@@ -1,0 +1,1029 @@
+% Options for packages loaded elsewhere
+\PassOptionsToPackage{unicode}{hyperref}
+\PassOptionsToPackage{hyphens}{url}
+\PassOptionsToPackage{dvipsnames,svgnames,x11names}{xcolor}
+%
+\documentclass[
+  10.5pt,
+]{article}
+\usepackage{amsmath,amssymb}
+\usepackage{iftex}
+\ifPDFTeX
+  \usepackage[T1]{fontenc}
+  \usepackage[utf8]{inputenc}
+  \usepackage{textcomp} % provide euro and other symbols
+\else % if luatex or xetex
+  \usepackage{unicode-math} % this also loads fontspec
+  \defaultfontfeatures{Scale=MatchLowercase}
+  \defaultfontfeatures[\rmfamily]{Ligatures=TeX,Scale=1}
+\fi
+\usepackage{lmodern}
+\ifPDFTeX\else
+  % xetex/luatex font selection
+\fi
+% Use upquote if available, for straight quotes in verbatim environments
+\IfFileExists{upquote.sty}{\usepackage{upquote}}{}
+\IfFileExists{microtype.sty}{% use microtype if available
+  \usepackage[]{microtype}
+  \UseMicrotypeSet[protrusion]{basicmath} % disable protrusion for tt fonts
+}{}
+\makeatletter
+\@ifundefined{KOMAClassName}{% if non-KOMA class
+  \IfFileExists{parskip.sty}{%
+    \usepackage{parskip}
+  }{% else
+    \setlength{\parindent}{0pt}
+    \setlength{\parskip}{6pt plus 2pt minus 1pt}}
+}{% if KOMA class
+  \KOMAoptions{parskip=half}}
+\makeatother
+\usepackage{xcolor}
+\usepackage[margin=0.85in]{geometry}
+\usepackage{listings}
+\newcommand{\passthrough}[1]{#1}
+\lstset{defaultdialect=[5.3]Lua}
+\lstset{defaultdialect=[x86masm]Assembler}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  breakatwhitespace=false,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  frame=single,
+  framerule=0.2pt,
+  xleftmargin=0.8em,
+  xrightmargin=0.8em,
+  aboveskip=0.8em,
+  belowskip=0.8em
+}
+\setlength{\emergencystretch}{3em} % prevent overfull lines
+\providecommand{\tightlist}{%
+  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\setcounter{secnumdepth}{5}
+\ifLuaTeX
+  \usepackage{selnolig}  % disable illegal ligatures
+\fi
+\usepackage{bookmark}
+\IfFileExists{xurl.sty}{\usepackage{xurl}}{} % add URL line breaks if available
+\urlstyle{same}
+\hypersetup{
+  colorlinks=true,
+  linkcolor={Maroon},
+  filecolor={Maroon},
+  citecolor={Blue},
+  urlcolor={Blue},
+  pdfcreator={LaTeX via pandoc}}
+
+\title{MiNES Variance-Weighted PMF Fusion: Implementation Specification}
+\author{Adaptive Nonequilibrium Sampling Notes}
+\date{May 5, 2026}
+
+\begin{document}
+\maketitle
+
+{
+\hypersetup{linkcolor=}
+\setcounter{tocdepth}{3}
+\tableofcontents
+}
+\section{Task: Implement a clean MiNES-only workflow with
+variance-weighted PMF
+fusion}\label{task-implement-a-clean-mines-only-workflow-with-variance-weighted-pmf-fusion}
+
+You are working in the current repository for adaptive nonequilibrium
+sampling. The existing \passthrough{\lstinline!adaptive\_methods.py!} is
+too broad and does not implement the intended MiNES algorithm cleanly.
+Do \textbf{not} modify \passthrough{\lstinline!adaptive\_methods.py!}
+unless absolutely necessary. Instead, create a new MiNES-only
+implementation.
+
+\subsection{Deliverables}\label{deliverables}
+
+Create three new files:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  \passthrough{\lstinline!scripts/mines\_variance\_fusion.py!}
+\item
+  \passthrough{\lstinline!scripts/run\_mines\_variance\_fusion.sh!}
+\item
+  \passthrough{\lstinline!notebooks/mines\_variance\_fusion\_visualization.ipynb!}
+\end{enumerate}
+
+The new Python file should only handle MiNES. It should not include AUS
+logic.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{\texorpdfstring{1. New Python file:
+\texttt{scripts/mines\_variance\_fusion.py}}{1. New Python file: scripts/mines\_variance\_fusion.py}}\label{new-python-file-scriptsmines_variance_fusion.py}
+
+\subsection{Goal}\label{goal}
+
+Implement MiNES as a chain of EQ clusters and NEQ segments, where every
+local reconstruction produces:
+
+\begin{lstlisting}[language=Python]
+PMF patch:
+    pmf(x)
+    variance(x)
+    coverage_mask(x)
+    unknown additive offset
+\end{lstlisting}
+
+The final PMF should be obtained by \textbf{global inverse-variance
+weighted fusion of all local PMF patches}, not by hard stitching.
+
+The high-level workflow is:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  Perform EQ simulations at endpoint ensembles
+  \passthrough{\lstinline!L0!} and \passthrough{\lstinline!R0!}.
+\item
+  Perform NEQ switching between \passthrough{\lstinline!L0!} and
+  \passthrough{\lstinline!R0!}.
+\item
+  Use the selected leaping method to decide child ensembles
+  \passthrough{\lstinline!L1!}, \passthrough{\lstinline!R1!}, then
+  perform EQ simulations.
+\item
+  For every neighboring pair of ensembles/clusters:
+
+  \begin{itemize}
+  \tightlist
+  \item
+    If JS divergence is below the threshold, merge them into an EQ
+    cluster and reconstruct an EQ MBAR patch.
+  \item
+    If JS divergence is above the threshold, construct an NEQ MTS patch
+    between them.
+  \end{itemize}
+\item
+  Continue growing children until the left and right frontiers cross or
+  meet.
+\item
+  After crossing, enter the rescue phase.
+\item
+  In rescue, target the grid bin with the largest global fused variance.
+\item
+  Add a rescue EQ window or NEQ bridge depending on where the
+  maximum-variance bin lies.
+\item
+  Reconstruct all patches and refit the global PMF after every rescue
+  round.
+\end{enumerate}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{Required command-line
+interface}\label{required-command-line-interface}
+
+The script should be executable as:
+
+\begin{lstlisting}[language=bash]
+python scripts/mines_variance_fusion.py \
+  --system-root <path> \
+  --bin <path-to-neq_sim> \
+  --seed 123 \
+  --label mines_variance_fusion \
+  --total-budget-steps 200000 \
+  --t-neq 5000 \
+  --n-neq-traj 100
+\end{lstlisting}
+
+Arguments:
+
+\begin{lstlisting}[language=Python]
+--system-root              required
+--bin                      required, path to compiled simulation binary
+--seed                     required int
+--label                    default: mines_variance_fusion
+--total-budget-steps       default: 200000
+--t-neq                    default: 5000
+--n-neq-traj               default: 100
+--n-eq-steps               default: 10000
+--eq-save-every            default: 10
+--tail-fraction            default: 0.9
+--q-next                   default: 0.9
+--alpha                    default: 2.0
+--x-leap                   default: 1.5
+--k-min                    default: 1.0
+--k-max                    default: 50.0
+--k-rescue                 default: 10.0
+--js-threshold             default: 0.8
+--bin-width                default: 0.1
+--max-generations          default: 10
+--max-rescue-rounds        default: 5
+--n-bootstrap-eq           default: 64
+--n-bootstrap-neq          default: 64
+--variance-floor           default: 1e-6
+\end{lstlisting}
+
+Output root:
+
+\begin{lstlisting}
+<system-root>/MINES/<label>/raw/seed_<seed>/
+\end{lstlisting}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{Core data structures}\label{core-data-structures}
+
+Implement explicit data classes.
+
+\subsection{\texorpdfstring{\texttt{EnsembleWindow}}{EnsembleWindow}}\label{ensemblewindow}
+
+\begin{lstlisting}[language=Python]
+@dataclass
+class EnsembleWindow:
+    name: str
+    center_x: float
+    k: float
+    root: Path
+    eq_file: Path
+    tail_file: Path
+    eq_rows: list[dict[str, str]]
+    tail_rows: list[dict[str, str]]
+    x_most: float
+    generation: int
+    side: str  # "left", "right", "rescue", "bridge"
+\end{lstlisting}
+
+\subsection{\texorpdfstring{\texttt{EQCluster}}{EQCluster}}\label{eqcluster}
+
+\begin{lstlisting}[language=Python]
+@dataclass
+class EQCluster:
+    name: str
+    windows: list[EnsembleWindow]
+    left_x: float
+    right_x: float
+\end{lstlisting}
+
+\subsection{\texorpdfstring{\texttt{NEQSegment}}{NEQSegment}}\label{neqsegment}
+
+\begin{lstlisting}[language=Python]
+@dataclass
+class NEQSegment:
+    name: str
+    left: EQCluster | EnsembleWindow
+    right: EQCluster | EnsembleWindow
+    root: Path
+    forward_trajectories: list[list[dict[str, str]]]
+    reverse_trajectories: list[list[dict[str, str]]]
+    forward_path_file: Path
+    reverse_path_file: Path
+\end{lstlisting}
+
+\subsection{\texorpdfstring{\texttt{PMFPatch}}{PMFPatch}}\label{pmfpatch}
+
+\begin{lstlisting}[language=Python]
+@dataclass
+class PMFPatch:
+    name: str
+    kind: str  # "EQ_MBAR" or "NEQ_MTS"
+    grid: np.ndarray
+    pmf: np.ndarray
+    variance: np.ndarray
+    coverage_mask: np.ndarray
+    source_names: list[str]
+    metadata: dict
+\end{lstlisting}
+
+The final global PMF should be constructed only from
+\passthrough{\lstinline!PMFPatch!} objects.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{Simulation helpers}\label{simulation-helpers}
+
+Reuse the existing simulator interface style from
+\passthrough{\lstinline!adaptive\_methods.py!}.
+
+Implement:
+
+\begin{lstlisting}[language=Python]
+run_eq_window(...)
+run_neq_protocol(...)
+write_protocol_path(...)
+read_csv_rows(...)
+write_csv(...)
+write_json(...)
+load_json(...)
+\end{lstlisting}
+
+Use \passthrough{\lstinline!run\_context.json!} from
+\passthrough{\lstinline!system\_root!}.
+
+The simulation binary should be called with the same low-level arguments
+used in the existing code:
+
+\begin{lstlisting}
+-pot
+-one-dimension
+-thermal_kT
+-dt
+-gamma
+-k0
+-x0
+-k1
+-x1
+-E1
+-k
+-center_xy
+-eq_out
+-T_eq
+-eq_nout
+-eq_seed
+-out_dir
+-log
+\end{lstlisting}
+
+For NEQ, use protocol path files and single-start trajectories, similar
+to the current implementation.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{PMF reconstruction logic}\label{pmf-reconstruction-logic}
+
+\subsection{EQ cluster patch}\label{eq-cluster-patch}
+
+Implement:
+
+\begin{lstlisting}[language=Python]
+build_eq_cluster_patch(cluster: EQCluster, grid: np.ndarray, ctx: dict, n_boot: int) -> PMFPatch
+\end{lstlisting}
+
+For a cluster with windows \(m = 1,\dots,M\):
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  Reconstruct the base PMF by MBAR using all EQ tail samples from all
+  windows in the cluster.
+\item
+  Bootstrap the EQ tail samples window-wise:
+
+  \begin{itemize}
+  \tightlist
+  \item
+    For each bootstrap replicate, resample each window's tail samples
+    with replacement.
+  \item
+    Reconstruct the MBAR PMF.
+  \end{itemize}
+\item
+  For each possible anchor window \(m\):
+
+  \begin{itemize}
+  \tightlist
+  \item
+    Align every bootstrap PMF to zero at \(x^{most}_m\).
+  \item
+    Compute: \[
+    \mathrm{var}_m(x) = \mathrm{Var}_b[F_b(x)-F_b(x^{most}_m)]
+    \]
+  \end{itemize}
+\item
+  Define: \[
+  \mathrm{var}_{EQ}(x)=\min_m \mathrm{var}_m(x)
+  \]
+\item
+  The base PMF can be stored in any consistent gauge, e.g.~shifted to
+  minimum zero. The global fusion step will determine patch offsets, so
+  the local gauge does not need to be final.
+\item
+  The coverage mask should be finite PMF and finite variance.
+\end{enumerate}
+
+Write patch files:
+
+\begin{lstlisting}
+patches/<patch_name>_pmf.csv
+patches/<patch_name>_bootstrap_variance.csv
+patches/<patch_name>_summary.json
+\end{lstlisting}
+
+CSV columns:
+
+\begin{lstlisting}
+x, pmf, variance, coverage, analytic_pmf
+\end{lstlisting}
+
+Also write per-anchor variance columns if useful:
+
+\begin{lstlisting}
+var_anchor_<window_name>
+\end{lstlisting}
+
+\subsection{NEQ MTS patch}\label{neq-mts-patch}
+
+Implement:
+
+\begin{lstlisting}[language=Python]
+build_neq_mts_patch(segment: NEQSegment, grid: np.ndarray, ctx: dict, n_boot: int) -> PMFPatch
+\end{lstlisting}
+
+For each non-overlapping neighboring pair:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  Run bidirectional NEQ.
+\item
+  Reconstruct PMF using bidirectional MTS.
+\item
+  Bootstrap the bidirectional MTS estimator.
+\item
+  Align each bootstrap PMF to the left anchor \(x^{most}_{left}\) and
+  compute: \[
+  \mathrm{var}_f(x)
+  \]
+\item
+  Align each bootstrap PMF to the right anchor \(x^{most}_{right}\) and
+  compute: \[
+  \mathrm{var}_r(x)
+  \]
+\item
+  Define: \[
+  \mathrm{var}_{NEQ}(x)=\min(\mathrm{var}_f(x), \mathrm{var}_r(x))
+  \]
+\item
+  Coverage mask should be finite PMF and finite variance.
+\end{enumerate}
+
+Write patch files:
+
+\begin{lstlisting}
+patches/<patch_name>_pmf.csv
+patches/<patch_name>_bootstrap_variance.csv
+patches/<patch_name>_summary.json
+\end{lstlisting}
+
+CSV columns:
+
+\begin{lstlisting}
+x, pmf, variance, var_left_anchor, var_right_anchor, coverage, analytic_pmf
+\end{lstlisting}
+
+Use existing functions from
+\passthrough{\lstinline!analysis/bidirectional\_mts\_pmf.py!} where
+possible:
+
+\begin{lstlisting}[language=Python]
+estimate_intermediate_reduced_free_energies
+build_bidirectional_mts_pmf
+bootstrap_bidirectional_mts_pmf
+align_pmf_to_reference
+align_pmf_to_endpoint_average_zero
+\end{lstlisting}
+
+Do not duplicate these algorithms unless necessary.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{Global PMF fusion}\label{global-pmf-fusion}
+
+Implement:
+
+\begin{lstlisting}[language=Python]
+fit_global_pmf_from_patches(
+    patches: list[PMFPatch],
+    grid: np.ndarray,
+    variance_floor: float,
+    reference_x: float | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict]
+\end{lstlisting}
+
+The final PMF should solve:
+
+\[
+\min_{G,c}
+\sum_p \sum_{x\in S_p}
+\frac{(G(x)-F_p(x)-c_p)^2}{\sigma_p^2(x)+\epsilon}
+\]
+
+where:
+
+\begin{itemize}
+\tightlist
+\item
+  \(G(x)\) is the global PMF.
+\item
+  \(F_p(x)\) is patch \(p\)'s PMF.
+\item
+  \(c_p\) is the additive offset of patch \(p\).
+\item
+  \(\sigma_p^2(x)\) is the patch variance.
+\item
+  \(\epsilon\) is \passthrough{\lstinline!variance\_floor!}.
+\end{itemize}
+
+Fix the gauge by setting either:
+
+\begin{lstlisting}
+G(reference_x) = 0
+\end{lstlisting}
+
+or, if \passthrough{\lstinline!reference\_x is None!}:
+
+\begin{lstlisting}
+min finite G(x) = 0
+\end{lstlisting}
+
+Also estimate approximate fused variance:
+
+\[
+\mathrm{var}_{global}(x)
+=
+\left[
+\sum_{p\in \mathcal{P}(x)}
+\frac{1}{\mathrm{var}_p(x)+\epsilon}
+\right]^{-1}
+\]
+
+This variance is approximate because patch errors are correlated, but it
+is useful for rescue targeting.
+
+Write:
+
+\begin{lstlisting}
+global_pmf.csv
+\end{lstlisting}
+
+with columns:
+
+\begin{lstlisting}
+x, global_pmf, global_variance, global_std, n_covering_patches, analytic_pmf
+\end{lstlisting}
+
+Also write:
+
+\begin{lstlisting}
+global_fit_summary.json
+\end{lstlisting}
+
+containing patch offsets, number of patches, RMS residuals, and gauge
+reference.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{Adaptive MiNES growth logic}\label{adaptive-mines-growth-logic}
+
+Implement a clean chain-based algorithm.
+
+Initialize:
+
+\begin{lstlisting}
+left_windows = [L0]
+right_windows = [R0]
+clusters = [cluster_L0, cluster_R0]
+segments = []
+patches = []
+\end{lstlisting}
+
+Step 1:
+
+\begin{itemize}
+\tightlist
+\item
+  EQ sample \passthrough{\lstinline!L0!}, \passthrough{\lstinline!R0!}.
+\item
+  NEQ sample between \passthrough{\lstinline!L0!},
+  \passthrough{\lstinline!R0!}.
+\item
+  Build an initial NEQ MTS patch.
+\end{itemize}
+
+Then for each generation:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  Use the chosen leaping rule to propose
+  \passthrough{\lstinline!L\_next!} from the current left frontier and
+  \passthrough{\lstinline!R\_next!} from the current right frontier.
+\item
+  Run EQ for \passthrough{\lstinline!L\_next!},
+  \passthrough{\lstinline!R\_next!}.
+\item
+  Insert them into the chain.
+\item
+  Rebuild neighboring relationships.
+\item
+  For each neighboring pair:
+
+  \begin{itemize}
+  \tightlist
+  \item
+    Compute JS divergence from EQ tail samples.
+  \item
+    If \passthrough{\lstinline!JS < js\_threshold!}, merge into an EQ
+    cluster and build one EQ MBAR patch.
+  \item
+    Else, run NEQ if it does not already exist and build an NEQ MTS
+    patch.
+  \end{itemize}
+\item
+  Fit global PMF from all patches.
+\item
+  Stop growth when the left and right frontiers cross or meet:
+
+  \begin{itemize}
+  \tightlist
+  \item
+    e.g.~\passthrough{\lstinline!L\_next.center\_x >= R\_next.center\_x!},
+    or
+  \item
+    \passthrough{\lstinline!L\_next.x\_most >= R\_next.x\_most!}, or
+  \item
+    target-cross condition based on the chosen leaping rule.
+  \end{itemize}
+\end{enumerate}
+
+Keep all decisions auditable. Write:
+
+\begin{lstlisting}
+windows.csv
+clusters.csv
+segments.csv
+patches.csv
+generation_summary.csv
+\end{lstlisting}
+
+Each generation should have a directory:
+
+\begin{lstlisting}
+generations/g00/
+generations/g01/
+...
+\end{lstlisting}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{Rescue phase}\label{rescue-phase}
+
+After the two ends meet/cross:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  Fit the global PMF using all current patches.
+\item
+  Find: \[
+  x^* = \arg\max_x \mathrm{var}_{global}(x)
+  \] among grid points with finite global PMF.
+\item
+  Add a rescue window near \(x^*\):
+
+  \begin{itemize}
+  \tightlist
+  \item
+    center at nearest grid point to \(x^*\)
+  \item
+    \passthrough{\lstinline!k = k\_rescue!} by default
+  \item
+    optionally increase \passthrough{\lstinline!k!} if the target is not
+    sampled in the tail quantile band.
+  \end{itemize}
+\item
+  Run EQ for the rescue window.
+\item
+  Recompute clusters/segments/patches.
+\item
+  Refit global PMF.
+\item
+  Repeat until:
+
+  \begin{itemize}
+  \tightlist
+  \item
+    max rescue rounds reached,
+  \item
+    total budget exhausted,
+  \item
+    or maximum global variance falls below a practical threshold if
+    implemented.
+  \end{itemize}
+\end{enumerate}
+
+Write:
+
+\begin{lstlisting}
+rescue_summary.csv
+rescue_round_<n>/...
+\end{lstlisting}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{Important behavior}\label{important-behavior}
+
+\subsection{Do not hard-stitch PMFs}\label{do-not-hard-stitch-pmfs}
+
+Do not implement final PMF as:
+
+\begin{lstlisting}[language=Python]
+if var_f[x] < var_r[x]:
+    use forward
+else:
+    use reverse
+\end{lstlisting}
+
+Do not implement final PMF as choosing one patch per bin.
+
+Use variance-weighted global fusion.
+
+\subsection{Use minimum variance only to define patch
+uncertainty}\label{use-minimum-variance-only-to-define-patch-uncertainty}
+
+Allowed:
+
+\begin{lstlisting}[language=Python]
+var_EQ(x) = min_m var_m(x)
+var_NEQ(x) = min(var_left_anchor(x), var_right_anchor(x))
+\end{lstlisting}
+
+Not allowed as the final PMF rule:
+
+\begin{lstlisting}[language=Python]
+PMF(x) = PMF_from_lowest_variance_patch(x)
+\end{lstlisting}
+
+\subsection{Keep local gauges separate from global
+gauge}\label{keep-local-gauges-separate-from-global-gauge}
+
+Each patch can have arbitrary local gauge. The global fusion step must
+solve additive offsets.
+
+\subsection{Write enough intermediate
+files}\label{write-enough-intermediate-files}
+
+The implementation should be easy to debug from disk outputs. For every
+generation, write:
+
+\begin{lstlisting}
+window summaries
+cluster summaries
+segment summaries
+patch PMF/variance files
+global PMF file
+\end{lstlisting}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{\texorpdfstring{2. Bash script:
+\texttt{scripts/run\_mines\_variance\_fusion.sh}}{2. Bash script: scripts/run\_mines\_variance\_fusion.sh}}\label{bash-script-scriptsrun_mines_variance_fusion.sh}
+
+Create a bash script that runs the new workflow with default parameters.
+
+Usage:
+
+\begin{lstlisting}[language=bash]
+bash scripts/run_mines_variance_fusion.sh
+\end{lstlisting}
+
+Optional arguments:
+
+\begin{lstlisting}[language=bash]
+bash scripts/run_mines_variance_fusion.sh \
+  --system-root results/doublewell_1d \
+  --bin ./build/neq_sim \
+  --seed 10101 \
+  --label mines_variance_fusion_test
+\end{lstlisting}
+
+Defaults:
+
+\begin{lstlisting}[language=bash]
+SYSTEM_ROOT="results/doublewell_1d"
+BIN="./build/neq_sim"
+SEED=10101
+LABEL="mines_variance_fusion"
+TOTAL_BUDGET_STEPS=200000
+T_NEQ=5000
+N_NEQ_TRAJ=100
+N_EQ_STEPS=10000
+\end{lstlisting}
+
+The script should:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  Check that the Python file exists.
+\item
+  Check that \passthrough{\lstinline!SYSTEM\_ROOT/run\_context.json!}
+  exists.
+\item
+  Check that the binary exists and is executable.
+\item
+  Create log directory:
+\end{enumerate}
+
+\begin{lstlisting}
+<SYSTEM_ROOT>/MINES/<LABEL>/logs/
+\end{lstlisting}
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\setcounter{enumi}{4}
+\tightlist
+\item
+  Run:
+\end{enumerate}
+
+\begin{lstlisting}[language=bash]
+python scripts/mines_variance_fusion.py ...
+\end{lstlisting}
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\setcounter{enumi}{5}
+\tightlist
+\item
+  Tee stdout/stderr to a timestamped log file.
+\end{enumerate}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{\texorpdfstring{3. Jupyter notebook:
+\texttt{notebooks/mines\_variance\_fusion\_visualization.ipynb}}{3. Jupyter notebook: notebooks/mines\_variance\_fusion\_visualization.ipynb}}\label{jupyter-notebook-notebooksmines_variance_fusion_visualization.ipynb}
+
+Create a notebook that visualizes the result.
+
+It should allow the user to set:
+
+\begin{lstlisting}[language=Python]
+system_root = "../results/doublewell_1d"
+label = "mines_variance_fusion"
+seed = 10101
+\end{lstlisting}
+
+The notebook should load:
+
+\begin{lstlisting}
+<system_root>/MINES/<label>/raw/seed_<seed>/global_pmf.csv
+windows.csv
+clusters.csv
+segments.csv
+patches.csv
+generation_summary.csv
+rescue_summary.csv
+\end{lstlisting}
+
+Plots:
+
+\subsection{Plot 1: Global PMF}\label{plot-1-global-pmf}
+
+Plot:
+
+\begin{lstlisting}
+x vs global_pmf
+x vs analytic_pmf
+uncertainty band using ± sqrt(global_variance)
+\end{lstlisting}
+
+\subsection{Plot 2: Global variance}\label{plot-2-global-variance}
+
+Plot:
+
+\begin{lstlisting}
+x vs global_variance
+\end{lstlisting}
+
+Mark rescue target positions if available.
+
+\subsection{Plot 3: Window centers}\label{plot-3-window-centers}
+
+Plot window centers over generation:
+
+\begin{lstlisting}
+generation vs center_x
+\end{lstlisting}
+
+Color or marker by side:
+
+\begin{lstlisting}
+left, right, rescue, bridge
+\end{lstlisting}
+
+\subsection{Plot 4: Patch coverage}\label{plot-4-patch-coverage}
+
+For each patch, show which grid points it covers.
+
+A simple heatmap is fine:
+
+\begin{lstlisting}
+x-axis: x
+y-axis: patch name
+value: coverage_mask
+\end{lstlisting}
+
+\subsection{Plot 5: Local patch PMFs}\label{plot-5-local-patch-pmfs}
+
+Overlay all local patch PMFs after applying fitted offsets from
+\passthrough{\lstinline!global\_fit\_summary.json!}.
+
+\subsection{Plot 6: Error profile}\label{plot-6-error-profile}
+
+If \passthrough{\lstinline!analytic\_pmf!} is available:
+
+\begin{lstlisting}
+x vs global_pmf - analytic_pmf
+\end{lstlisting}
+
+Also print RMSE over finite points.
+
+The notebook should be robust if some files do not exist yet.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{Acceptance criteria}\label{acceptance-criteria}
+
+The implementation is considered correct if:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  It creates
+  \passthrough{\lstinline!scripts/mines\_variance\_fusion.py!}.
+\item
+  It creates
+  \passthrough{\lstinline!scripts/run\_mines\_variance\_fusion.sh!}.
+\item
+  It creates
+  \passthrough{\lstinline!notebooks/mines\_variance\_fusion\_visualization.ipynb!}.
+\item
+  The Python script only implements MiNES, not AUS.
+\item
+  EQ-overlapping ensembles are merged into EQ clusters.
+\item
+  EQ clusters use MBAR PMF reconstruction.
+\item
+  EQ cluster variance is computed as:
+\end{enumerate}
+
+\[
+\mathrm{var}_{EQ}(x)=\min_m \mathrm{var}_m(x)
+\]
+
+where each \(\mathrm{var}_m(x)\) comes from bootstrap PMFs aligned to
+\(x^{most}_m\).
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\setcounter{enumi}{7}
+\tightlist
+\item
+  Non-overlapping neighboring ensembles/clusters use bidirectional
+  NEQ/MTS.
+\item
+  NEQ variance is computed as:
+\end{enumerate}
+
+\[
+\mathrm{var}_{NEQ}(x)=\min(\mathrm{var}_{left-anchor}(x), \mathrm{var}_{right-anchor}(x)).
+\]
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\setcounter{enumi}{9}
+\tightlist
+\item
+  The final PMF is not hard-stitched. It is obtained by inverse-variance
+  weighted global fusion with fitted patch offsets.
+\item
+  The rescue target is selected from the maximum global fused variance.
+\item
+  All intermediate PMF, variance, window, cluster, segment, and rescue
+  summaries are written to disk.
+\item
+  The bash script runs the workflow with sensible defaults.
+\item
+  The notebook visualizes global PMF, variance, windows, patches, rescue
+  targets, and error against analytic PMF.
+\end{enumerate}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{Notes}\label{notes}
+
+Prioritize correctness and clarity over cleverness. Keep the file
+modular. Avoid mixing old experimental protocols into this new
+implementation. This should become the clean reference implementation of
+MiNES with variance-weighted PMF fusion.
+
+\end{document}
