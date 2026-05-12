@@ -4,3 +4,6 @@ __pycache__/
 data/
 *.DS_Store
 simulations/cpp/neq_sim
+claude-plan/
+theory/
+logs

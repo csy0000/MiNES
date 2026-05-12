@@ -259,16 +259,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--rescue-background-fit-method",
-        choices=["neq", "mean-only", "auto"],
-        default="neq",
-        help="Background fit method for rescue window design. neq=NEQ quadratic fit with mean-only fallback; mean-only=existing mean-only GT only; auto=same as neq with explicit fallback diagnostics.",
+        choices=["global-pmf", "mean-only", "auto"],
+        default="global-pmf",
+        help="Background fit method for rescue window design. global-pmf=fit global fused PMF locally with mean-only fallback; mean-only=mean-only GT only; auto=same as global-pmf with explicit fallback diagnostics.",
     )
-    parser.add_argument("--rescue-neq-fit-min-bins", default=5, type=int,
-        help="Minimum number of valid bins required for NEQ quadratic fit acceptance.")
-    parser.add_argument("--rescue-neq-fit-k0-min-abs", default=1.0e-8, type=float,
-        help="Minimum |k0| required for NEQ quadratic fit acceptance.")
-    parser.add_argument("--rescue-neq-fit-x0-margin-factor", default=0.25, type=float,
+    parser.add_argument("--rescue-global-fit-min-bins", default=5, type=int,
+        help="Minimum number of valid bins for global-PMF quadratic fit acceptance.")
+    parser.add_argument("--rescue-global-fit-k0-min-abs", default=1.0e-8, type=float,
+        help="Minimum |k0| for global-PMF quadratic fit acceptance.")
+    parser.add_argument("--rescue-global-fit-x0-margin-factor", default=0.25, type=float,
         help="Allowed x0 margin as a fraction of segment width beyond boundary means.")
+    parser.add_argument("--rescue-global-fit-radius", default=None, type=float,
+        help="If set, restrict global-PMF fit domain to ±radius around target_bin_x.")
+    # Deprecated aliases kept for backward compat
+    parser.add_argument("--rescue-neq-fit-min-bins", default=5, type=int,
+        help="Deprecated alias for --rescue-global-fit-min-bins.")
+    parser.add_argument("--rescue-neq-fit-k0-min-abs", default=1.0e-8, type=float,
+        help="Deprecated alias for --rescue-global-fit-k0-min-abs.")
+    parser.add_argument("--rescue-neq-fit-x0-margin-factor", default=0.25, type=float,
+        help="Deprecated alias for --rescue-global-fit-x0-margin-factor.")
     return parser.parse_args()
 
 
@@ -1207,6 +1216,136 @@ def get_neq_fit_for_rescue(
                         best_fit = hs_fit
 
     return best_fit, fit_rows
+
+
+def fit_quadratic_background_from_global_pmf(
+    *,
+    target_bin_x: float,
+    grid: np.ndarray,
+    global_pmf: np.ndarray,
+    global_variance: "np.ndarray | None",
+    variance_floor: float,
+    left_boundary: "EnsembleWindow",
+    right_boundary: "EnsembleWindow",
+    min_fit_bins: int = 5,
+    k0_min_abs: float = 1.0e-8,
+    x0_margin_factor: float = 0.25,
+    bin_width: float = 0.1,
+    fit_radius: "float | None" = None,
+) -> dict[str, Any]:
+    """Fit a weighted quadratic F(x)=a*x²+b*x+c to the global fused PMF near target_bin_x."""
+    _nan = float("nan")
+    _base = {
+        "fit_accepted": False,
+        "fit_source": "global_pmf_quadratic_fit",
+        "segment": "",
+        "patch_name": "global_pmf",
+        "patch_kind": "GLOBAL_FUSED_PMF",
+        "n_fit_bins": 0,
+        "x_fit_min": _nan, "x_fit_max": _nan,
+        "k0": _nan, "x0": _nan, "F0": _nan,
+        "a": _nan, "b": _nan, "c": _nan,
+        "weighted_rmse": _nan, "reduced_chi2": _nan,
+        "variance_floor": float(variance_floor),
+        "fallback_reason": "",
+    }
+
+    m_L = float(left_boundary.mean_x)
+    m_R = float(right_boundary.mean_x)
+    t_x = float(target_bin_x)
+    segment_width = max(abs(m_R - m_L), float(bin_width))
+    margin = max(2.0 * float(bin_width), float(x0_margin_factor) * segment_width)
+    lo = min(m_L, m_R, t_x) - margin
+    hi = max(m_L, m_R, t_x) + margin
+    if fit_radius is not None:
+        lo = max(lo, t_x - float(fit_radius))
+        hi = min(hi, t_x + float(fit_radius))
+
+    grid_arr = np.asarray(grid, dtype=float)
+    pmf_arr = np.asarray(global_pmf, dtype=float)
+    domain_mask = (grid_arr >= lo) & (grid_arr <= hi) & np.isfinite(pmf_arr)
+
+    n_fit_bins = int(np.sum(domain_mask))
+    if n_fit_bins < min_fit_bins:
+        return {**_base, "n_fit_bins": n_fit_bins,
+                "fallback_reason": f"too_few_valid_bins:{n_fit_bins}<{min_fit_bins}"}
+
+    x_fit = grid_arr[domain_mask]
+    f_fit = pmf_arr[domain_mask]
+
+    if global_variance is not None:
+        var_arr = np.asarray(global_variance, dtype=float)
+        var_local = var_arr[domain_mask]
+        has_var = np.isfinite(var_local)
+        if np.any(has_var):
+            w_fit = np.where(has_var, 1.0 / (var_local + float(variance_floor)), 1.0 / float(variance_floor))
+        else:
+            w_fit = np.full(n_fit_bins, 1.0 / float(variance_floor))
+    else:
+        w_fit = np.full(n_fit_bins, 1.0 / float(variance_floor))
+
+    sqrt_w = np.sqrt(w_fit)
+    A = np.column_stack([x_fit ** 2, x_fit, np.ones(n_fit_bins)])
+    Aw = A * sqrt_w[:, None]
+    fw = f_fit * sqrt_w
+    try:
+        theta, _, _, _ = np.linalg.lstsq(Aw, fw, rcond=None)
+    except Exception as exc:
+        return {**_base, "n_fit_bins": n_fit_bins, "fallback_reason": f"lstsq_failed:{exc}"}
+
+    a_val, b_val, c_val = float(theta[0]), float(theta[1]), float(theta[2])
+    k0_fit = 2.0 * a_val
+
+    if abs(k0_fit) < float(k0_min_abs):
+        return {**_base, "n_fit_bins": n_fit_bins, "a": a_val, "b": b_val, "c": c_val, "k0": k0_fit,
+                "fallback_reason": f"k0_below_min_abs:{abs(k0_fit):.3e}<{k0_min_abs}"}
+
+    x0_fit = -b_val / (2.0 * a_val)
+    F0_fit = c_val - 0.5 * k0_fit * x0_fit ** 2
+
+    if not (np.isfinite(k0_fit) and np.isfinite(x0_fit) and np.isfinite(F0_fit)):
+        return {**_base, "n_fit_bins": n_fit_bins, "a": a_val, "b": b_val, "c": c_val,
+                "k0": k0_fit, "x0": x0_fit, "fallback_reason": "nonfinite_k0_x0_or_F0"}
+
+    # x0 sanity: must be within margin of the local segment
+    seg_width2 = abs(m_R - m_L)
+    margin2 = max(2.0 * float(bin_width), float(x0_margin_factor) * max(seg_width2, float(bin_width)))
+    lo_x0 = min(m_L, m_R, t_x) - margin2
+    hi_x0 = max(m_L, m_R, t_x) + margin2
+    if not (lo_x0 <= x0_fit <= hi_x0):
+        return {**_base, "n_fit_bins": n_fit_bins, "a": a_val, "b": b_val, "c": c_val,
+                "k0": k0_fit, "x0": x0_fit, "F0": F0_fit,
+                "fallback_reason": f"x0_outside_margin:{x0_fit:.4f} not in [{lo_x0:.4f},{hi_x0:.4f}]"}
+
+    residuals = A @ theta - f_fit
+    weighted_ss = float(np.sum(w_fit * residuals ** 2))
+    weighted_rmse = float(np.sqrt(weighted_ss / n_fit_bins)) if n_fit_bins > 0 else _nan
+    reduced_chi2 = float(weighted_ss / max(n_fit_bins - 3, 1))
+
+    if not np.isfinite(weighted_rmse):
+        return {**_base, "n_fit_bins": n_fit_bins, "a": a_val, "b": b_val, "c": c_val,
+                "k0": k0_fit, "x0": x0_fit, "F0": F0_fit,
+                "weighted_rmse": weighted_rmse, "reduced_chi2": reduced_chi2,
+                "fallback_reason": "nonfinite_weighted_rmse"}
+
+    return {
+        "fit_accepted": True,
+        "fit_source": "global_pmf_quadratic_fit",
+        "segment": "",
+        "patch_name": "global_pmf",
+        "patch_kind": "GLOBAL_FUSED_PMF",
+        "n_fit_bins": n_fit_bins,
+        "x_fit_min": float(np.min(x_fit)),
+        "x_fit_max": float(np.max(x_fit)),
+        "k0": k0_fit,
+        "x0": x0_fit,
+        "F0": F0_fit,
+        "a": a_val, "b": b_val, "c": c_val,
+        "weighted_rmse": weighted_rmse,
+        "reduced_chi2": reduced_chi2,
+        "variance_floor": float(variance_floor),
+        "fallback_reason": "",
+    }
 
 
 def midpoint_xs_ks_from_EQ(
@@ -4620,6 +4759,8 @@ def design_rescue_window_mean_only_gt(
     all_segments: "list[NEQSegment] | None" = None,
     neq_patch_store: "dict[str, PMFPatch] | None" = None,
     neq_quad_fit_rows: "list[dict[str, Any]] | None" = None,
+    global_pmf: "np.ndarray | None" = None,
+    global_variance: "np.ndarray | None" = None,
     grid: np.ndarray,
     args: argparse.Namespace,
     analysis_xmin: float,
@@ -4660,6 +4801,19 @@ def design_rescue_window_mean_only_gt(
         "rescue_gt_x_clipped_to_segment": False,
         "rescue_gt_x_clipped_to_analysis_range": False,
         "rescue_design_rule": "mean_only_GT_fallback_no_bracket",
+        # global_fit_* fields (populated when global-pmf fit is attempted)
+        "global_fit_method": rescue_fit_method,
+        "global_fit_source": "", "global_fit_accepted": False,
+        "global_fit_fallback_reason": "",
+        "global_fit_n_bins": 0,
+        "global_fit_x_min": _nan, "global_fit_x_max": _nan,
+        "global_fit_k0": _nan, "global_fit_x0": _nan, "global_fit_F0": _nan,
+        "global_fit_a": _nan, "global_fit_b": _nan, "global_fit_c": _nan,
+        "global_fit_weighted_rmse": _nan, "global_fit_reduced_chi2": _nan,
+        "global_fit_design_rule": "",
+        "global_fit_x_res_raw": _nan, "global_fit_x_res": _nan,
+        "global_fit_k_res_raw": _nan, "global_fit_k_res": _nan,
+        "global_fit_s_raw": _nan, "global_fit_s_used": _nan, "global_fit_sigma_s": _nan,
     }
 
     if mean_pair is None:
@@ -4765,18 +4919,21 @@ def design_rescue_window_mean_only_gt(
     EQ_R = eq_gt_tuple(right_boundary)
     x0_L_gt, k0_L_gt, x0_R_gt, k0_R_gt, _hm = get_k0_x0_harmonic_fromEQ(EQ_L, EQ_R)
 
-    # ---- NEQ quadratic fit (when rescue_background_fit_method is neq or auto) ----
-    if rescue_fit_method in ("neq", "auto") and all_segments is not None and neq_patch_store is not None:
-        _n_boot_fit = max(getattr(args, "n_bootstrap_neq", 16), 2)
+    # ---- Global PMF quadratic fit (when rescue_background_fit_method is global-pmf or auto) ----
+    if rescue_fit_method in ("global-pmf", "auto") and global_pmf is not None:
         _var_floor = float(getattr(args, "variance_floor", 1.0e-6))
-        _min_bins = int(getattr(args, "rescue_neq_fit_min_bins", 5))
-        _k0_min = float(getattr(args, "rescue_neq_fit_k0_min_abs", 1.0e-8))
-        _x0_mf = float(getattr(args, "rescue_neq_fit_x0_margin_factor", 0.25))
-        neq_fit, _fit_rows = get_neq_fit_for_rescue(
+        _min_bins = int(getattr(args, "rescue_global_fit_min_bins",
+                                getattr(args, "rescue_neq_fit_min_bins", 5)))
+        _k0_min = float(getattr(args, "rescue_global_fit_k0_min_abs",
+                                getattr(args, "rescue_neq_fit_k0_min_abs", 1.0e-8)))
+        _x0_mf = float(getattr(args, "rescue_global_fit_x0_margin_factor",
+                               getattr(args, "rescue_neq_fit_x0_margin_factor", 0.25)))
+        _fit_radius = getattr(args, "rescue_global_fit_radius", None)
+        gfit = fit_quadratic_background_from_global_pmf(
             target_bin_x=target_bin_x,
-            all_segments=all_segments,
-            neq_patch_store=neq_patch_store,
             grid=grid,
+            global_pmf=global_pmf,
+            global_variance=global_variance,
             variance_floor=_var_floor,
             left_boundary=left_boundary,
             right_boundary=right_boundary,
@@ -4784,109 +4941,125 @@ def design_rescue_window_mean_only_gt(
             k0_min_abs=_k0_min,
             x0_margin_factor=_x0_mf,
             bin_width=float(grid_dx),
-            ctx=ctx,
-            out_root=rescue_round_root,
-            n_boot=_n_boot_fit,
-            rng_seed=int(getattr(args, "seed", 0)) + 800000,
+            fit_radius=_fit_radius,
         )
-        if neq_quad_fit_rows is not None:
-            neq_quad_fit_rows.extend(_fit_rows)
+        # Always record global fit diagnostics
+        _empty_fit_fields.update({
+            "global_fit_method": rescue_fit_method,
+            "global_fit_source": str(gfit.get("fit_source", "")),
+            "global_fit_accepted": bool(gfit.get("fit_accepted", False)),
+            "global_fit_fallback_reason": str(gfit.get("fallback_reason", "")),
+            "global_fit_n_bins": int(gfit.get("n_fit_bins", 0)),
+            "global_fit_x_min": float(gfit.get("x_fit_min", _nan)),
+            "global_fit_x_max": float(gfit.get("x_fit_max", _nan)),
+            "global_fit_k0": float(gfit.get("k0", _nan)),
+            "global_fit_x0": float(gfit.get("x0", _nan)),
+            "global_fit_F0": float(gfit.get("F0", _nan)),
+            "global_fit_a": float(gfit.get("a", _nan)),
+            "global_fit_b": float(gfit.get("b", _nan)),
+            "global_fit_c": float(gfit.get("c", _nan)),
+            "global_fit_weighted_rmse": float(gfit.get("weighted_rmse", _nan)),
+            "global_fit_reduced_chi2": float(gfit.get("reduced_chi2", _nan)),
+        })
 
-        if neq_fit["fit_accepted"]:
-            k0_nf = float(neq_fit["k0"])
-            x0_nf = float(neq_fit["x0"])
+        if gfit["fit_accepted"]:
+            k0_gf = float(gfit["k0"])
+            x0_gf = float(gfit["x0"])
             # Interpolation coordinate
-            _denom_nf = m_R - m_L
-            if abs(_denom_nf) < 1e-9:
-                _s_raw_nf = _nan
-                _s_used_nf = 0.5
-                _s_fb_nf = True
+            _denom_gf = m_R - m_L
+            if abs(_denom_gf) < 1e-9:
+                _s_raw_gf = _nan
+                _s_used_gf = 0.5
+                _s_fb_gf = True
             else:
-                _s_raw_nf = (target_bin_x - m_L) / _denom_nf
-                if 0.0 < _s_raw_nf < 1.0:
-                    _s_used_nf = _s_raw_nf
-                    _s_fb_nf = False
+                _s_raw_gf = (target_bin_x - m_L) / _denom_gf
+                if 0.0 < _s_raw_gf < 1.0:
+                    _s_used_gf = _s_raw_gf
+                    _s_fb_gf = False
                 else:
-                    _s_used_nf = 0.5
-                    _s_fb_nf = True
-            # Target sigma (linear interpolation)
-            _sigma_nf = (1.0 - _s_used_nf) * sigma_L + _s_used_nf * sigma_R
-            if _sigma_nf <= 0.0 or not np.isfinite(_sigma_nf):
-                # sigma fallback: could not compute valid GT params
-                neq_fit["fit_accepted"] = False
-                neq_fit["fallback_reason"] = (neq_fit.get("fallback_reason") or "") + ":invalid_sigma_target"
+                    _s_used_gf = 0.5
+                    _s_fb_gf = True
+            _sigma_gf = (1.0 - _s_used_gf) * sigma_L + _s_used_gf * sigma_R
+            if _sigma_gf <= 0.0 or not np.isfinite(_sigma_gf):
+                gfit["fit_accepted"] = False
+                gfit["fallback_reason"] = (gfit.get("fallback_reason") or "") + ":invalid_sigma_target"
             else:
-                _K_nf = 1.0 / (_sigma_nf ** 2)
-                _k_raw_nf = _K_nf - k0_nf
-                _k_final_nf = float(np.clip(_k_raw_nf, float(args.k_min), float(args.k_max)))
-                if _k_raw_nf < float(args.k_min):
-                    _k_clipped_nf = "k_min"
-                elif _k_raw_nf > float(args.k_max):
-                    _k_clipped_nf = "k_max"
+                _K_gf = 1.0 / (_sigma_gf ** 2)
+                _k_raw_gf = _K_gf - k0_gf
+                _k_final_gf = float(np.clip(_k_raw_gf, float(args.k_min), float(args.k_max)))
+                _k_clipped_gf = (
+                    "k_min" if _k_raw_gf < float(args.k_min)
+                    else ("k_max" if _k_raw_gf > float(args.k_max) else "")
+                )
+                if not np.isfinite(_k_final_gf) or _k_final_gf <= 0.0:
+                    gfit["fit_accepted"] = False
+                    gfit["fallback_reason"] = (gfit.get("fallback_reason") or "") + ":invalid_k_rescue"
                 else:
-                    _k_clipped_nf = ""
-                if not np.isfinite(_k_final_nf) or _k_final_nf <= 0.0:
-                    neq_fit["fit_accepted"] = False
-                    neq_fit["fallback_reason"] = (neq_fit.get("fallback_reason") or "") + ":invalid_k_rescue"
-                else:
-                    _x_raw_nf = ((k0_nf + _k_final_nf) * target_bin_x - k0_nf * x0_nf) / _k_final_nf
-                    if not np.isfinite(_x_raw_nf):
-                        neq_fit["fit_accepted"] = False
-                        neq_fit["fallback_reason"] = (neq_fit.get("fallback_reason") or "") + ":nonfinite_x_rescue"
+                    _x_raw_gf = ((k0_gf + _k_final_gf) * target_bin_x - k0_gf * x0_gf) / _k_final_gf
+                    if not np.isfinite(_x_raw_gf):
+                        gfit["fit_accepted"] = False
+                        gfit["fallback_reason"] = (gfit.get("fallback_reason") or "") + ":nonfinite_x_rescue"
                     else:
-                        # Clamp: first to segment bounds, then to analysis range
                         _seg_lo = min(float(left_boundary.center_x), float(right_boundary.center_x))
                         _seg_hi = max(float(left_boundary.center_x), float(right_boundary.center_x))
-                        _x_clamp1 = float(np.clip(_x_raw_nf, _seg_lo, _seg_hi))
-                        _clipped_seg = abs(_x_clamp1 - _x_raw_nf) > 1e-9
-                        _x_final_nf = float(np.clip(_x_clamp1, analysis_xmin, analysis_xmax))
-                        _clipped_ana = abs(_x_final_nf - _x_clamp1) > 1e-9
-                        _fit_gt_fields: dict[str, Any] = {
+                        _x_clamp1_gf = float(np.clip(_x_raw_gf, _seg_lo, _seg_hi))
+                        _clipped_seg_gf = abs(_x_clamp1_gf - _x_raw_gf) > 1e-9
+                        _x_final_gf = float(np.clip(_x_clamp1_gf, analysis_xmin, analysis_xmax))
+                        _clipped_ana_gf = abs(_x_final_gf - _x_clamp1_gf) > 1e-9
+                        _gfit_fields: dict[str, Any] = {
                             "rescue_background_fit_method": rescue_fit_method,
-                            "rescue_fit_source": str(neq_fit.get("fit_source", "")),
-                            "rescue_fit_segment": str(neq_fit.get("segment", "")),
-                            "rescue_fit_patch": str(neq_fit.get("patch_name", "")),
+                            "rescue_fit_source": "global_pmf_quadratic_fit",
+                            "rescue_fit_segment": "",
+                            "rescue_fit_patch": "global_pmf",
                             "rescue_fit_accepted": True,
-                            "rescue_fit_fallback_reason": str(neq_fit.get("fallback_reason", "")),
-                            "rescue_fit_n_bins": int(neq_fit.get("n_fit_bins", 0)),
-                            "rescue_fit_x_min": float(neq_fit.get("x_fit_min", _nan)),
-                            "rescue_fit_x_max": float(neq_fit.get("x_fit_max", _nan)),
-                            "rescue_fit_k0": k0_nf,
-                            "rescue_fit_x0": x0_nf,
-                            "rescue_fit_F0": float(neq_fit.get("F0", _nan)),
-                            "rescue_fit_weighted_rmse": float(neq_fit.get("weighted_rmse", _nan)),
-                            "rescue_fit_reduced_chi2": float(neq_fit.get("reduced_chi2", _nan)),
+                            "rescue_fit_fallback_reason": "",
+                            "rescue_fit_n_bins": int(gfit.get("n_fit_bins", 0)),
+                            "rescue_fit_x_min": float(gfit.get("x_fit_min", _nan)),
+                            "rescue_fit_x_max": float(gfit.get("x_fit_max", _nan)),
+                            "rescue_fit_k0": k0_gf,
+                            "rescue_fit_x0": x0_gf,
+                            "rescue_fit_F0": float(gfit.get("F0", _nan)),
+                            "rescue_fit_weighted_rmse": float(gfit.get("weighted_rmse", _nan)),
+                            "rescue_fit_reduced_chi2": float(gfit.get("reduced_chi2", _nan)),
                             "rescue_gt_m_L": m_L, "rescue_gt_m_R": m_R,
                             "rescue_gt_sigma_L": sigma_L, "rescue_gt_sigma_R": sigma_R,
                             "rescue_gt_m_target": float(target_bin_x),
-                            "rescue_gt_s_raw": float(_s_raw_nf),
-                            "rescue_gt_s_used": float(_s_used_nf),
-                            "rescue_gt_sigma_target": float(_sigma_nf),
-                            "rescue_gt_K_target": float(_K_nf),
-                            "rescue_gt_k_raw": float(_k_raw_nf),
-                            "rescue_gt_k_final": float(_k_final_nf),
-                            "rescue_gt_x_raw": float(_x_raw_nf),
-                            "rescue_gt_x_final": float(_x_final_nf),
-                            "rescue_gt_x_clipped_to_segment": bool(_clipped_seg),
-                            "rescue_gt_x_clipped_to_analysis_range": bool(_clipped_ana),
-                            "rescue_design_rule": "neq_quadratic_GT",
+                            "rescue_gt_s_raw": float(_s_raw_gf),
+                            "rescue_gt_s_used": float(_s_used_gf),
+                            "rescue_gt_sigma_target": float(_sigma_gf),
+                            "rescue_gt_K_target": float(_K_gf),
+                            "rescue_gt_k_raw": float(_k_raw_gf),
+                            "rescue_gt_k_final": float(_k_final_gf),
+                            "rescue_gt_x_raw": float(_x_raw_gf),
+                            "rescue_gt_x_final": float(_x_final_gf),
+                            "rescue_gt_x_clipped_to_segment": bool(_clipped_seg_gf),
+                            "rescue_gt_x_clipped_to_analysis_range": bool(_clipped_ana_gf),
+                            "rescue_design_rule": "global_pmf_quadratic_fit_GT",
+                            "global_fit_design_rule": "global_pmf_quadratic_fit_GT",
+                            "global_fit_x_res_raw": float(_x_raw_gf),
+                            "global_fit_x_res": float(_x_final_gf),
+                            "global_fit_k_res_raw": float(_k_raw_gf),
+                            "global_fit_k_res": float(_k_final_gf),
+                            "global_fit_s_raw": float(_s_raw_gf),
+                            "global_fit_s_used": float(_s_used_gf),
+                            "global_fit_sigma_s": float(_sigma_gf),
                         }
                         return {
                             "x_rescue_target": float(x_target),
                             "target_bin_x": float(target_bin_x),
                             "target_bin_index": int(target_bin_index),
-                            "rescue_center_x_raw": float(_x_raw_nf),
-                            "rescue_center_x": float(_x_final_nf),
-                            "rescue_center_clamped_to_bounds": bool(_clipped_seg or _clipped_ana),
-                            "rescue_center_rule": "neq_quadratic_background_GT",
-                            "rescue_k": float(_k_final_nf),
-                            "rescue_k_rule": "neq_fit_K_target_minus_k0",
-                            "rescue_k_retry_rule": "disabled_for_neq_GT",
-                            "rescue_k_unclipped": float(_k_raw_nf),
-                            "rescue_k_saturated": bool(_k_final_nf >= float(args.k_max) - 1.0e-12),
-                            "rescue_k_base": float(_k_raw_nf),
-                            "sigma_target": float(_sigma_nf),
-                            "k_from_sigma": float(_K_nf),
+                            "rescue_center_x_raw": float(_x_raw_gf),
+                            "rescue_center_x": float(_x_final_gf),
+                            "rescue_center_clamped_to_bounds": bool(_clipped_seg_gf or _clipped_ana_gf),
+                            "rescue_center_rule": "global_pmf_quadratic_fit_GT",
+                            "rescue_k": float(_k_final_gf),
+                            "rescue_k_rule": "global_pmf_fit_K_target_minus_k0",
+                            "rescue_k_retry_rule": "disabled_for_global_pmf_GT",
+                            "rescue_k_unclipped": float(_k_raw_gf),
+                            "rescue_k_saturated": bool(_k_final_gf >= float(args.k_max) - 1.0e-12),
+                            "rescue_k_base": float(_k_raw_gf),
+                            "sigma_target": float(_sigma_gf),
+                            "k_from_sigma": float(_K_gf),
                             "rescue_retry_count": 0,
                             "rescue_scale": 1.0,
                             "matched_child_name": "",
@@ -4914,23 +5087,23 @@ def design_rescue_window_mean_only_gt(
                             "gt_right_x_most": float(right_boundary.x_most),
                             "gt_m_L": m_L, "gt_m_R": m_R,
                             "gt_sigma_L": sigma_L, "gt_sigma_R": sigma_R,
-                            "gt_s_raw": float(_s_raw_nf),
-                            "gt_s_used": float(_s_used_nf),
-                            "gt_s_fallback_to_midpoint": bool(_s_fb_nf),
-                            "gt_s_eff": float(_s_used_nf),
-                            "gt_x_raw": float(_x_raw_nf),
-                            "gt_k_raw": float(_k_raw_nf),
-                            "gt_x_clipped": bool(_clipped_seg or _clipped_ana),
-                            "gt_k_clipped": bool(_k_clipped_nf != ""),
+                            "gt_s_raw": float(_s_raw_gf),
+                            "gt_s_used": float(_s_used_gf),
+                            "gt_s_fallback_to_midpoint": bool(_s_fb_gf),
+                            "gt_s_eff": float(_s_used_gf),
+                            "gt_x_raw": float(_x_raw_gf),
+                            "gt_k_raw": float(_k_raw_gf),
+                            "gt_x_clipped": bool(_clipped_seg_gf or _clipped_ana_gf),
+                            "gt_k_clipped": bool(_k_clipped_gf != ""),
                             "gt_x0_L": float(x0_L_gt),
                             "gt_k0_L": float(k0_L_gt),
                             "gt_x0_R": float(x0_R_gt),
                             "gt_k0_R": float(k0_R_gt),
-                            "gt_used_midpoint_fallback": bool(_s_fb_nf),
+                            "gt_used_midpoint_fallback": bool(_s_fb_gf),
                             "gt_fallback_reason": "",
                             "gt_boundary_pair_reason": "",
                             "gt_anchor_coordinate": "mean_x",
-                            "mo_rescue_design_method": "neq_quadratic_GT",
+                            "mo_rescue_design_method": "global_pmf_quadratic_fit_GT",
                             "mo_left_window": left_boundary.name,
                             "mo_right_window": right_boundary.name,
                             "mo_x_L": float(left_boundary.center_x),
@@ -4940,40 +5113,36 @@ def design_rescue_window_mean_only_gt(
                             "mo_k_R": float(right_boundary.k),
                             "mo_m_R": m_R, "mo_sigma_R": sigma_R,
                             "mo_x_target": float(target_bin_x),
-                            "mo_s_raw": float(_s_raw_nf), "mo_s_used": float(_s_used_nf),
-                            "mo_s_fallback_to_midpoint": bool(_s_fb_nf),
-                            "mo_sigma_s": float(_sigma_nf), "mo_sigma_s_fallback_used": False,
-                            "mo_k0_mean_only": k0_nf, "mo_x0_mean_only": x0_nf,
+                            "mo_s_raw": float(_s_raw_gf), "mo_s_used": float(_s_used_gf),
+                            "mo_s_fallback_to_midpoint": bool(_s_fb_gf),
+                            "mo_sigma_s": float(_sigma_gf), "mo_sigma_s_fallback_used": False,
+                            "mo_k0_mean_only": k0_gf, "mo_x0_mean_only": x0_gf,
                             "mo_x0_right_check": _nan, "mo_x0_left_right_abs_diff": _nan,
                             "mo_kT_eff_L": _nan, "mo_kT_eff_R": _nan,
                             "mo_kT_eff": _nan, "mo_kT_eff_ratio": _nan,
                             "mo_kT_eff_fallback_used": False,
-                            "mo_k_res_raw": float(_k_raw_nf),
-                            "mo_k_res": float(_k_final_nf),
-                            "mo_k_res_clipped_to": _k_clipped_nf,
-                            "mo_x_res_raw": float(_x_raw_nf),
-                            "mo_x_res": float(_x_final_nf),
-                            "mo_x_res_clipped": bool(_clipped_seg or _clipped_ana),
+                            "mo_k_res_raw": float(_k_raw_gf),
+                            "mo_k_res": float(_k_final_gf),
+                            "mo_k_res_clipped_to": _k_clipped_gf,
+                            "mo_x_res_raw": float(_x_raw_gf),
+                            "mo_x_res": float(_x_final_gf),
+                            "mo_x_res_clipped": bool(_clipped_seg_gf or _clipped_ana_gf),
                             "mo_fallback_reason": "",
-                            **_fit_gt_fields,
+                            **{**_empty_fit_fields, **_gfit_fields},
                         }
-        # NEQ fit not accepted or skipped — update empty_fit_fields with diagnostic info
+        # Global PMF fit not accepted — update empty_fit_fields with fallback info
         _empty_fit_fields.update({
             "rescue_background_fit_method": rescue_fit_method,
-            "rescue_fit_source": str(neq_fit.get("fit_source", "")),
-            "rescue_fit_segment": str(neq_fit.get("segment", "")),
-            "rescue_fit_patch": str(neq_fit.get("patch_name", "")),
+            "rescue_fit_source": str(gfit.get("fit_source", "")),
+            "rescue_fit_segment": "",
+            "rescue_fit_patch": "global_pmf",
             "rescue_fit_accepted": False,
-            "rescue_fit_fallback_reason": str(neq_fit.get("fallback_reason", "")),
-            "rescue_fit_n_bins": int(neq_fit.get("n_fit_bins", 0)),
-            "rescue_fit_x_min": float(neq_fit.get("x_fit_min", _nan)),
-            "rescue_fit_x_max": float(neq_fit.get("x_fit_max", _nan)),
-            "rescue_fit_k0": float(neq_fit.get("k0", _nan)),
-            "rescue_fit_x0": float(neq_fit.get("x0", _nan)),
-            "rescue_fit_F0": float(neq_fit.get("F0", _nan)),
-            "rescue_fit_weighted_rmse": float(neq_fit.get("weighted_rmse", _nan)),
-            "rescue_fit_reduced_chi2": float(neq_fit.get("reduced_chi2", _nan)),
-            "rescue_design_rule": "mean_only_GT_fallback_neq_fit_rejected",
+            "rescue_fit_fallback_reason": str(gfit.get("fallback_reason", "")),
+            "rescue_fit_n_bins": int(gfit.get("n_fit_bins", 0)),
+            "rescue_fit_k0": float(gfit.get("k0", _nan)),
+            "rescue_fit_x0": float(gfit.get("x0", _nan)),
+            "rescue_design_rule": "mean_only_GT_fallback_global_pmf_fit_rejected",
+            "global_fit_design_rule": "rejected",
         })
 
     # ---- mean-only diagnostic variables (initialized to nan/default) ----
@@ -5462,6 +5631,29 @@ _RESCUE_SUMMARY_COLS = [
     "rescue_gt_x_clipped_to_segment",
     "rescue_gt_x_clipped_to_analysis_range",
     "rescue_design_rule",
+    "global_fit_method",
+    "global_fit_source",
+    "global_fit_accepted",
+    "global_fit_fallback_reason",
+    "global_fit_n_bins",
+    "global_fit_x_min",
+    "global_fit_x_max",
+    "global_fit_k0",
+    "global_fit_x0",
+    "global_fit_F0",
+    "global_fit_a",
+    "global_fit_b",
+    "global_fit_c",
+    "global_fit_weighted_rmse",
+    "global_fit_reduced_chi2",
+    "global_fit_design_rule",
+    "global_fit_x_res_raw",
+    "global_fit_x_res",
+    "global_fit_k_res_raw",
+    "global_fit_k_res",
+    "global_fit_s_raw",
+    "global_fit_s_used",
+    "global_fit_sigma_s",
     "rescue_tail_q05",
     "rescue_tail_q50",
     "rescue_tail_q95",
@@ -6121,6 +6313,8 @@ def main() -> None:
                 all_segments=all_segments,
                 neq_patch_store=neq_patch_store,
                 neq_quad_fit_rows=neq_quad_fit_rows,
+                global_pmf=global_pmf,
+                global_variance=global_variance,
                 grid=grid,
                 args=args,
                 analysis_xmin=float(analysis_xmin),
@@ -6274,6 +6468,7 @@ def main() -> None:
             **{k: v for k, v in rescue_design.items() if k.startswith("gt_")},
             **{k: v for k, v in rescue_design.items() if k.startswith("mo_")},
             **{k: v for k, v in rescue_design.items() if k.startswith("rescue_fit_") or k.startswith("rescue_gt_") or k == "rescue_background_fit_method" or k == "rescue_design_rule"},
+            **{k: v for k, v in rescue_design.items() if k.startswith("global_fit_")},
             **_tail_stats,
             "added_window": rescue_name,
             "added_center_x": float(rescue_window.center_x),
