@@ -123,6 +123,14 @@ struct CmdOptions {
     double us_grid_dy = 0.0;
     unsigned int us_seed = 20260322u;
 
+    // Chunk/checkpoint support for NEQ mode
+    bool neq_chunk_mode = false;
+    int neq_chunk_start = 0;
+    int neq_chunk_end = -1;   // -1 = run to full T_neq
+    std::string neq_checkpoint_in;
+    std::string neq_checkpoint_out;
+    bool neq_append = false;
+
     bool have_meta_xmin = false;
     bool have_meta_xmax = false;
     bool have_meta_ymin = false;
@@ -287,6 +295,214 @@ bool reconstruct_meta_fes(const SimConfig& cfg,
     shift_free_energy_min_zero(free_energy);
     write_meta_fes_2d_csv(out_path, grid, free_energy, bias_values);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// NEQ chunk/checkpoint support
+// ---------------------------------------------------------------------------
+
+struct NeqChunkState {
+    double x = 0.0;
+    double y = 0.0;
+    double work = 0.0;
+    int step = 0;
+    std::string rng_state;
+};
+
+static bool load_chunk_state(const std::string& ckpt_dir, const std::string& direction,
+                              int traj_id, NeqChunkState& state) {
+    const std::string fname =
+        ckpt_dir + "/" + direction + "_" + std::to_string(traj_id) + ".ckpt";
+    std::ifstream f(fname);
+    if (!f.is_open()) return false;
+    std::string line;
+    while (std::getline(f, line)) {
+        const auto eq_pos = line.find('=');
+        if (eq_pos == std::string::npos) continue;
+        const std::string key = line.substr(0, eq_pos);
+        const std::string val = line.substr(eq_pos + 1);
+        if (key == "step")      state.step = std::stoi(val);
+        else if (key == "x")    state.x    = std::stod(val);
+        else if (key == "y")    state.y    = std::stod(val);
+        else if (key == "work") state.work = std::stod(val);
+        else if (key == "rng_state") state.rng_state = val;
+    }
+    return !state.rng_state.empty();
+}
+
+static void save_chunk_state(const std::string& ckpt_dir, const std::string& direction,
+                              int traj_id, const NeqChunkState& state) {
+    std::filesystem::create_directories(ckpt_dir);
+    const std::string fname =
+        ckpt_dir + "/" + direction + "_" + std::to_string(traj_id) + ".ckpt";
+    std::ofstream f(fname);
+    f << "step=" << state.step << "\n";
+    f << "x=" << std::fixed << std::setprecision(15) << state.x << "\n";
+    f << "y=" << std::fixed << std::setprecision(15) << state.y << "\n";
+    f << "work=" << std::fixed << std::setprecision(15) << state.work << "\n";
+    f << "rng_state=" << state.rng_state << "\n";
+}
+
+// Chunk-aware forward NEQ runner.
+// chunk_start..chunk_end (exclusive) within the full protocol.
+// If chunk_start > 0 and a valid checkpoint exists in ckpt_in_dir, resumes from it.
+// Always writes/appends to cfg.out_dir/neq_fwd_<traj_idx>.csv.
+// Saves checkpoint to ckpt_out_dir if non-empty.
+// RNG note: velocity is re-thermalised from Maxwell-Boltzmann at each chunk boundary;
+// the mt19937 positional sequence is preserved exactly via stream serialisation.
+static void run_neq_forward_chunk(
+    const SimConfig& cfg, int traj_idx,
+    const std::vector<Vec2>& eq_samples, const PathData& path,
+    int chunk_start, int chunk_end,
+    const std::string& ckpt_in_dir, const std::string& ckpt_out_dir,
+    bool append_mode
+) {
+    NeqChunkState ckpt{};
+    const bool has_ckpt = (chunk_start > 0) && !ckpt_in_dir.empty() &&
+                           load_chunk_state(ckpt_in_dir, "fwd", traj_idx, ckpt);
+
+    LangevinRng rng(cfg.neq_seed + static_cast<unsigned int>(traj_idx));
+    Vec2 pos{};
+    double work = 0.0;
+
+    if (has_ckpt) {
+        pos = {ckpt.x, ckpt.y};
+        work = ckpt.work;
+        std::istringstream iss(ckpt.rng_state);
+        iss >> rng.rng;
+    } else {
+        pos = pick_start(rng, eq_samples, cfg.A);
+    }
+    Vec2 vel = sample_maxwell(cfg, rng);
+
+    std::ostringstream fname;
+    fname << cfg.out_dir << "/neq_fwd_" << traj_idx << ".csv";
+    const auto open_mode = append_mode
+        ? (std::ios::out | std::ios::app)
+        : std::ios::out;
+    std::ofstream out(fname.str(), open_mode);
+    if (!append_mode) {
+        out << "step,lambda,x,y,base_u,bias_u,work\n";
+    }
+
+    const int nsteps = static_cast<int>(path.points.size());
+    const int end    = std::min(chunk_end, nsteps);
+
+    for (int step = chunk_start; step < end; ++step) {
+        const double lam = path.lambdas[step];
+        BiasHarmonic bias{path.k[step], path.points[step]};
+        langevin_vv_step(cfg, bias, pos, vel, rng);
+
+        const double base_u    = potential_U(cfg, pos.x, pos.y);
+        const double bias_u    = harmonic_bias_energy(cfg, bias, pos);
+        const double work_before = work;
+
+        if (cfg.neq_output_stride <= 1 ||
+            (step % cfg.neq_output_stride == 0) ||
+            (step + 1 == nsteps) || (step + 1 == end)) {
+            out << step << "," << std::setprecision(10) << lam << ","
+                << pos.x << "," << pos.y << ","
+                << base_u << "," << bias_u << ","
+                << work_before << "\n";
+        }
+
+        if (step + 1 < nsteps) {
+            BiasHarmonic bias_next{path.k[step + 1], path.points[step + 1]};
+            work += harmonic_bias_energy(cfg, bias_next, pos) - bias_u;
+        }
+    }
+
+    if (!ckpt_out_dir.empty()) {
+        NeqChunkState new_ckpt{};
+        new_ckpt.x    = pos.x;
+        new_ckpt.y    = pos.y;
+        new_ckpt.work = work;
+        new_ckpt.step = end - 1;
+        std::ostringstream rng_oss;
+        rng_oss << rng.rng;
+        new_ckpt.rng_state = rng_oss.str();
+        save_chunk_state(ckpt_out_dir, "fwd", traj_idx, new_ckpt);
+    }
+}
+
+// Chunk-aware backward NEQ runner. Mirrors run_neq_forward_chunk for the reverse schedule.
+static void run_neq_backward_chunk(
+    const SimConfig& cfg, int traj_idx,
+    const std::vector<Vec2>& eq_samples, const PathData& path,
+    int chunk_start, int chunk_end,
+    const std::string& ckpt_in_dir, const std::string& ckpt_out_dir,
+    bool append_mode
+) {
+    const unsigned int seed =
+        cfg.neq_seed + static_cast<unsigned int>(cfg.n_neq_traj + traj_idx);
+    NeqChunkState ckpt{};
+    const bool has_ckpt = (chunk_start > 0) && !ckpt_in_dir.empty() &&
+                           load_chunk_state(ckpt_in_dir, "bwd", traj_idx, ckpt);
+
+    LangevinRng rng(seed);
+    Vec2 pos{};
+    double work = 0.0;
+
+    if (has_ckpt) {
+        pos = {ckpt.x, ckpt.y};
+        work = ckpt.work;
+        std::istringstream iss(ckpt.rng_state);
+        iss >> rng.rng;
+    } else {
+        pos = pick_start(rng, eq_samples, cfg.B);
+    }
+    Vec2 vel = sample_maxwell(cfg, rng);
+
+    std::ostringstream fname;
+    fname << cfg.out_dir << "/neq_bwd_" << traj_idx << ".csv";
+    const auto open_mode = append_mode
+        ? (std::ios::out | std::ios::app)
+        : std::ios::out;
+    std::ofstream out(fname.str(), open_mode);
+    if (!append_mode) {
+        out << "step,lambda,x,y,base_u,bias_u,work\n";
+    }
+
+    const int nsteps = static_cast<int>(path.points.size());
+    const int end    = std::min(chunk_end, nsteps);
+
+    for (int step = chunk_start; step < end; ++step) {
+        const int idx  = nsteps - 1 - step;
+        const double lam = path.lambdas[idx];
+        BiasHarmonic bias{path.k[idx], path.points[idx]};
+        langevin_vv_step(cfg, bias, pos, vel, rng);
+
+        const double base_u    = potential_U(cfg, pos.x, pos.y);
+        const double bias_u    = harmonic_bias_energy(cfg, bias, pos);
+        const double work_before = work;
+
+        if (cfg.neq_output_stride <= 1 ||
+            (step % cfg.neq_output_stride == 0) ||
+            (step + 1 == nsteps) || (step + 1 == end)) {
+            out << step << "," << std::setprecision(10) << lam << ","
+                << pos.x << "," << pos.y << ","
+                << base_u << "," << bias_u << ","
+                << work_before << "\n";
+        }
+
+        if (step + 1 < nsteps) {
+            const int idx_next = nsteps - 2 - step;
+            BiasHarmonic bias_next{path.k[idx_next], path.points[idx_next]};
+            work += harmonic_bias_energy(cfg, bias_next, pos) - bias_u;
+        }
+    }
+
+    if (!ckpt_out_dir.empty()) {
+        NeqChunkState new_ckpt{};
+        new_ckpt.x    = pos.x;
+        new_ckpt.y    = pos.y;
+        new_ckpt.work = work;
+        new_ckpt.step = end - 1;
+        std::ostringstream rng_oss;
+        rng_oss << rng.rng;
+        new_ckpt.rng_state = rng_oss.str();
+        save_chunk_state(ckpt_out_dir, "bwd", traj_idx, new_ckpt);
+    }
 }
 
 void print_usage() {
@@ -564,6 +780,18 @@ bool parse_args(int argc, char** argv, CmdOptions& opt) {
         } else if (arg == "-E1") {
             if (!next_double(opt.pot_E1)) return false;
             opt.have_pot_E1 = true;
+        } else if (arg == "-neq_chunk_mode") {
+            int v; if (!next_int(v)) return false; opt.neq_chunk_mode = (v != 0);
+        } else if (arg == "-neq_chunk_start") {
+            if (!next_int(opt.neq_chunk_start)) return false;
+        } else if (arg == "-neq_chunk_end") {
+            if (!next_int(opt.neq_chunk_end)) return false;
+        } else if (arg == "-neq_checkpoint_in") {
+            if (!next(opt.neq_checkpoint_in)) return false;
+        } else if (arg == "-neq_checkpoint_out") {
+            if (!next(opt.neq_checkpoint_out)) return false;
+        } else if (arg == "-neq_append") {
+            int v; if (!next_int(v)) return false; opt.neq_append = (v != 0);
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
             return false;
@@ -1065,9 +1293,26 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        for (int i = 0; i < cfg.n_neq_traj; ++i) {
-            run_neq_forward(cfg, i, eq0_samples, path);
-            run_neq_backward(cfg, i, eq1_samples, path);
+        if (opt.neq_chunk_mode) {
+            const int chunk_start = opt.neq_chunk_start;
+            const int chunk_end   = (opt.neq_chunk_end >= 0)
+                                        ? opt.neq_chunk_end
+                                        : cfg.n_neq_steps;
+            for (int i = 0; i < cfg.n_neq_traj; ++i) {
+                run_neq_forward_chunk(cfg, i, eq0_samples, path,
+                                      chunk_start, chunk_end,
+                                      opt.neq_checkpoint_in, opt.neq_checkpoint_out,
+                                      opt.neq_append);
+                run_neq_backward_chunk(cfg, i, eq1_samples, path,
+                                       chunk_start, chunk_end,
+                                       opt.neq_checkpoint_in, opt.neq_checkpoint_out,
+                                       opt.neq_append);
+            }
+        } else {
+            for (int i = 0; i < cfg.n_neq_traj; ++i) {
+                run_neq_forward(cfg, i, eq0_samples, path);
+                run_neq_backward(cfg, i, eq1_samples, path);
+            }
         }
 
         const auto t_end = std::chrono::steady_clock::now();
@@ -1094,6 +1339,12 @@ int main(int argc, char** argv) {
             "neq_output_stride=" + std::to_string(cfg.neq_output_stride),
             "neq_seed=" + std::to_string(cfg.neq_seed),
             "one_dimension=" + std::string(1, cfg.one_dimension),
+            "chunk_mode=" + std::to_string(static_cast<int>(opt.neq_chunk_mode)),
+            "chunk_start=" + std::to_string(opt.neq_chunk_start),
+            "chunk_end=" + std::to_string(opt.neq_chunk_end),
+            "checkpoint_in=" + opt.neq_checkpoint_in,
+            "checkpoint_out=" + opt.neq_checkpoint_out,
+            "append=" + std::to_string(static_cast<int>(opt.neq_append)),
             "started_at=" + now_timestamp(),
             "elapsed_sec=" + format_seconds(elapsed)
         };

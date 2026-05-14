@@ -1200,6 +1200,417 @@ def run_early_truncating_nes_child_placement_v4(
 
 
 # ---------------------------------------------------------------------------
+# True simulator-level chunked NES with early stopping
+# ---------------------------------------------------------------------------
+
+def run_neq_segment_v4_chunked_until_child_ready(
+    *,
+    name: str,
+    left_boundary: "EnsembleWindow",
+    right_boundary: "EnsembleWindow",
+    left_source: "EQCluster | EnsembleWindow",
+    right_source: "EQCluster | EnsembleWindow",
+    bin_path: str,
+    ctx: dict[str, Any],
+    args: "argparse.Namespace",
+    grid: np.ndarray,
+    profile: "GlobalGTWidthProfile",
+    beta_eff: float,
+    seed: int,
+    root: Path,
+    k_min: float,
+    k_max: float,
+    budget: "BudgetTracker",
+    generation: int,
+    out_root: Path,
+) -> dict[str, Any]:
+    """True simulator-level chunked NES with early stopping.
+
+    Runs NES in chunks of size t_neq // nes_fractions.  After each chunk the
+    bidirectional frontier overlap and MTS local fit are checked.  The
+    simulator loop stops as soon as both child designs are valid or budget is
+    exhausted.  Budget is charged per chunk rather than pre-charged for the
+    full protocol.
+
+    Returns the same dict shape as run_early_truncating_nes_child_placement_v4
+    plus ``actual_t_neq_used``, ``fraction_used``, ``n_chunks_run``,
+    ``chunk_rows``.  ``segment`` contains only the frames written to disk
+    (not a full-length trajectory).
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    t_neq = max(2, int(args.t_neq))
+    n_neq_traj = int(args.n_neq_traj)
+    n_fractions = max(1, int(args.nes_fractions))
+    kT = float(ctx.get("thermal_kT", 1.0))
+    q_low = float(args.nes_front_overlap_q_low)
+    q_high = float(args.nes_front_overlap_q_high)
+
+    # 1. Build the full protocol once and write to disk.
+    proto = build_linear_bridge_protocol(
+        left_boundary, right_boundary, t_neq, k_min, k_max,
+        k_mid_scale=float(args.neq_k_mid_scale),
+    )
+    centers_fwd, ks_fwd = proto["centers"], proto["ks"]
+    fwd_path = root / "protocol_forward.csv"
+    rev_path = root / "protocol_reverse.csv"
+    _write_protocol_path(fwd_path, centers_fwd, ks_fwd)
+    _write_protocol_path(rev_path, list(reversed(centers_fwd)), list(reversed(ks_fwd)))
+    protocol_k_fwd = float(np.mean([abs(k) for k in ks_fwd]))
+    k_midscale = float(ctx.get("nes_screen", {}).get("fixed", {}).get("k_midscale", 1.0))
+    neq_nout_clamped = max(2, int(args.neq_nout))
+
+    # 2. GT/KL fallback designs.
+    left_design_gt = design_child_window(
+        current_window=left_boundary, opposite_window=right_boundary,
+        profile=profile, k_min=k_min, k_max=k_max,
+        beta_eff=beta_eff, target_kl=float(args.target_kl), direction="right",
+    )
+    right_design_gt = design_child_window(
+        current_window=right_boundary, opposite_window=left_boundary,
+        profile=profile, k_min=k_min, k_max=k_max,
+        beta_eff=beta_eff, target_kl=float(args.target_kl), direction="left",
+    )
+    left_target_mean = float(left_design_gt["m_next"])
+    left_target_sigma = float(left_design_gt["sigma_next"])
+    right_target_mean = float(right_design_gt["m_next"])
+    right_target_sigma = float(right_design_gt["sigma_next"])
+
+    # 3. Chunk endpoints (exclusive upper bound).
+    n_time = len(centers_fwd)  # actual protocol length (may equal t_neq)
+    chunk_size = max(1, n_time // n_fractions)
+    chunk_ends = sorted(set(
+        [min(chunk_size * (i + 1), n_time) for i in range(n_fractions)] + [n_time]
+    ))
+
+    diag_dir = out_root / "early_truncation" / f"generation_{generation}"
+    diag_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_base = root / "checkpoints"
+
+    # Shared simulator args (minus chunk-specific flags).
+    neq_common = [
+        bin_path, *build_common_args(ctx),
+        "-k", str(protocol_k_fwd), "-k_midscale", str(k_midscale),
+        "-A_center", f"{float(left_boundary.center_x)},0.0",
+        "-B_center", f"{float(right_boundary.center_x)},0.0",
+        "-eq0", str(left_boundary.eq_file),
+        "-eq1", str(right_boundary.eq_file),
+        "-fpath", str(fwd_path),
+        "-N_neq", str(n_neq_traj), "-T_neq", str(t_neq),
+        "-neq_nout", str(neq_nout_clamped),
+        "-neq_seed", str(seed),
+        "-out_dir", str(root),
+        "-neq_chunk_mode", "1",
+    ]
+
+    # Tracking state.
+    left_mts_design: dict[str, Any] | None = None
+    right_mts_design: dict[str, Any] | None = None
+    left_design_source = "gt_fallback"
+    right_design_source = "gt_fallback"
+    chunk_rows: list[dict[str, Any]] = []
+    fallback_reasons: list[str] = []
+    chunk_start = 0
+    n_chunks_run = 0
+    actual_t_neq_used = n_time
+    fraction_used = 1.0
+    cumulative_cost = 0
+    prev_ckpt_dir = ""
+    stopped_early = False
+
+    for chunk_idx, chunk_end in enumerate(chunk_ends):
+        chunk_cost = 2 * n_neq_traj * (chunk_end - chunk_start)
+        if not budget.can_spend(chunk_cost):
+            print(
+                f"[v4 chunked] Budget exhausted before chunk {chunk_idx} "
+                f"(generation {generation}); using GT fallback"
+            )
+            fallback_reasons.append("budget_exhausted")
+            break
+
+        this_ckpt_dir = str(ckpt_base / f"chunk_{chunk_idx:03d}")
+        append_flag = "0" if chunk_idx == 0 else "1"
+
+        cmd = neq_common + [
+            "-neq_chunk_start", str(chunk_start),
+            "-neq_chunk_end", str(chunk_end),
+            "-neq_checkpoint_out", this_ckpt_dir,
+            "-neq_append", append_flag,
+            "-log", str(root / f"neq_chunk_{chunk_idx:03d}.log"),
+        ]
+        if prev_ckpt_dir:
+            cmd += ["-neq_checkpoint_in", prev_ckpt_dir]
+
+        run_checked(cmd)
+        budget.spend(chunk_cost, name, "NEQ_CHUNK",
+                     f"generation_{generation}_chunk_{chunk_idx}")
+        cumulative_cost += chunk_cost
+        n_chunks_run += 1
+        actual_t_neq_used = chunk_end
+        fraction_used = float(chunk_end) / float(n_time)
+
+        # Read current trajectory files.
+        trajs_ok = False
+        x_fwd = work_fwd = x_rev = work_rev = None
+        fwd_trajs_raw: list[list[dict[str, str]]] = []
+        rev_trajs_raw: list[list[dict[str, str]]] = []
+        fwd_files_raw: list[Path] = []
+        rev_files_raw: list[Path] = []
+        front: dict[str, Any] = {
+            "fwd_mean": float("nan"), "rev_mean": float("nan"),
+            "fwd_q05": float("nan"), "fwd_q50": float("nan"), "fwd_q95": float("nan"),
+            "rev_q05": float("nan"), "rev_q50": float("nan"), "rev_q95": float("nan"),
+            "fronts_overlapped": False,
+        }
+        left_target_reached = False
+        right_target_reached = False
+
+        try:
+            fwd_trajs_raw, fwd_files_raw = read_traj_files(root, "forward")
+            rev_trajs_raw, rev_files_raw = read_traj_files(root, "reverse")
+            fwd_frames = [pd.DataFrame(rows) for rows in fwd_trajs_raw]
+            rev_frames = [pd.DataFrame(rows) for rows in rev_trajs_raw]
+            x_fwd, work_fwd = trajectory_frames_to_arrays(fwd_frames)
+            x_rev, work_rev = trajectory_frames_to_arrays(rev_frames)
+            trajs_ok = (
+                x_fwd.ndim == 2 and x_fwd.shape[1] >= 2
+                and x_rev.ndim == 2 and x_rev.shape[1] >= 2
+            )
+        except Exception as exc:
+            trajs_ok = False
+            fallback_reasons.append(f"chunk_{chunk_idx}_traj_read_error: {exc}")
+
+        if trajs_ok:
+            x_fwd_front = x_fwd[:, -1]
+            x_rev_front = x_rev[:, -1]
+            front = neq_frontiers_overlap(x_fwd_front, x_rev_front, q_low=q_low, q_high=q_high)
+            left_target_reached = direction_reached(front["fwd_mean"], left_target_mean, "right")
+            right_target_reached = direction_reached(front["rev_mean"], right_target_mean, "left")
+
+        cft_attempted = False
+        cft_solved_chunk = False
+        mts_solved_chunk = False
+        left_fit_valid = False
+        right_fit_valid = False
+        left_design_valid_this = False
+        right_design_valid_this = False
+        reason = ""
+
+        if trajs_ok and front["fronts_overlapped"]:
+            cft_attempted = True
+            # Build temporary NEQSegment for MTS computation.
+            temp_seg = NEQSegment(
+                name=name, left=left_source, right=right_source,
+                left_boundary=left_boundary, right_boundary=right_boundary, root=root,
+                forward_trajectories=fwd_trajs_raw, reverse_trajectories=rev_trajs_raw,
+                forward_trajectory_files=fwd_files_raw,
+                reverse_trajectory_files=rev_files_raw,
+                forward_path_file=fwd_path, reverse_path_file=rev_path,
+                protocol_k=protocol_k_fwd, protocol_mode="linear_v4_chunked",
+                connectivity={}, mts_patch_built=False, cft_summary={},
+            )
+            mts_result = build_neq_mts_prefix_pmf_no_bootstrap_v4(
+                segment=temp_seg, grid=grid, ctx=ctx,
+                prefix_n_time=int(x_fwd.shape[1]),
+            )
+            cft_solved_chunk = bool(mts_result.get("cft_solved", False))
+            mts_solved_chunk = bool(mts_result.get("mts_solved", False))
+            reason = str(mts_result.get("reason", ""))
+
+            if mts_solved_chunk:
+                pmf_chunk = mts_result["pmf"]
+
+                if left_target_reached and left_mts_design is None:
+                    lfit = fit_local_mts_background_for_target(
+                        grid=grid, pmf=pmf_chunk,
+                        target_mean=left_target_mean, target_sigma=left_target_sigma,
+                        halfwidth_sigma=float(args.mts_local_fit_halfwidth_sigma),
+                        min_points=int(args.mts_local_fit_min_points),
+                    )
+                    left_fit_valid = bool(lfit["fit_valid"])
+                    if left_fit_valid:
+                        ld = design_child_from_background_fit(
+                            target_mean=left_target_mean, target_sigma=left_target_sigma,
+                            k_bg=float(lfit["k_bg"]), x_bg=float(lfit["x_bg"]),
+                            beta_eff=beta_eff, k_min=k_min, k_max=k_max,
+                        )
+                        left_design_valid_this = bool(ld["design_valid"])
+                        if left_design_valid_this:
+                            left_mts_design = ld
+                            left_design_source = "mts_chunked"
+
+                if right_target_reached and right_mts_design is None:
+                    rfit = fit_local_mts_background_for_target(
+                        grid=grid, pmf=pmf_chunk,
+                        target_mean=right_target_mean, target_sigma=right_target_sigma,
+                        halfwidth_sigma=float(args.mts_local_fit_halfwidth_sigma),
+                        min_points=int(args.mts_local_fit_min_points),
+                    )
+                    right_fit_valid = bool(rfit["fit_valid"])
+                    if right_fit_valid:
+                        rd = design_child_from_background_fit(
+                            target_mean=right_target_mean, target_sigma=right_target_sigma,
+                            k_bg=float(rfit["k_bg"]), x_bg=float(rfit["x_bg"]),
+                            beta_eff=beta_eff, k_min=k_min, k_max=k_max,
+                        )
+                        right_design_valid_this = bool(rd["design_valid"])
+                        if right_design_valid_this:
+                            right_mts_design = rd
+                            right_design_source = "mts_chunked"
+        elif trajs_ok:
+            reason = "bidirectional_fronts_not_overlapped"
+            fallback_reasons.append(f"chunk_{chunk_idx}:{reason}")
+
+        chunk_rows.append({
+            "generation": generation,
+            "chunk_index": chunk_idx,
+            "chunk_start": chunk_start,
+            "chunk_end": chunk_end,
+            "actual_t_neq_used": chunk_end,
+            "fraction": float(chunk_end) / float(n_time),
+            "checkpoint_in": prev_ckpt_dir,
+            "checkpoint_out": this_ckpt_dir,
+            "fwd_mean": front["fwd_mean"],
+            "rev_mean": front["rev_mean"],
+            "fwd_q05": front["fwd_q05"],
+            "fwd_q50": front["fwd_q50"],
+            "fwd_q95": front["fwd_q95"],
+            "rev_q05": front["rev_q05"],
+            "rev_q50": front["rev_q50"],
+            "rev_q95": front["rev_q95"],
+            "fronts_overlapped": int(front["fronts_overlapped"]),
+            "left_target_mean": left_target_mean,
+            "left_target_reached": int(left_target_reached),
+            "right_target_mean": right_target_mean,
+            "right_target_reached": int(right_target_reached),
+            "cft_attempted": int(cft_attempted),
+            "cft_solved": int(cft_solved_chunk),
+            "mts_solved": int(mts_solved_chunk),
+            "left_fit_valid": int(left_fit_valid),
+            "right_fit_valid": int(right_fit_valid),
+            "left_design_valid": int(left_design_valid_this),
+            "right_design_valid": int(right_design_valid_this),
+            "left_design_source": left_design_source,
+            "right_design_source": right_design_source,
+            "chunk_cost": chunk_cost,
+            "cumulative_neq_cost": cumulative_cost,
+            "reason": reason,
+        })
+
+        prev_ckpt_dir = this_ckpt_dir
+        chunk_start = chunk_end
+
+        if left_mts_design is not None and right_mts_design is not None:
+            stopped_early = True
+            break
+
+    # Resolve final designs.
+    def _mts_to_final(mts_d: dict[str, Any], gt_d: dict[str, Any], side: str) -> dict[str, Any]:
+        d = dict(mts_d)
+        d["m_next"] = d["target_mean"]
+        d["sigma_next"] = d["target_sigma"]
+        d["proposal_rule"] = "true_simulator_chunked_mts_local_fit"
+        d["side"] = side
+        d["parent_window"] = gt_d.get("parent_window", "")
+        d["opposite_window"] = gt_d.get("opposite_window", "")
+        d["search_direction"] = side
+        return d
+
+    left_design_final = (
+        _mts_to_final(left_mts_design, left_design_gt, "right")
+        if left_mts_design is not None else left_design_gt
+    )
+    right_design_final = (
+        _mts_to_final(right_mts_design, right_design_gt, "left")
+        if right_mts_design is not None else right_design_gt
+    )
+
+    # Read final (possibly truncated) trajectories for the NEQSegment.
+    try:
+        fwd_trajs_final, fwd_files_final = read_traj_files(root, "forward")
+        rev_trajs_final, rev_files_final = read_traj_files(root, "reverse")
+    except Exception:
+        fwd_trajs_final, fwd_files_final = [], []
+        rev_trajs_final, rev_files_final = [], []
+
+    seg = NEQSegment(
+        name=name, left=left_source, right=right_source,
+        left_boundary=left_boundary, right_boundary=right_boundary, root=root,
+        forward_trajectories=fwd_trajs_final, reverse_trajectories=rev_trajs_final,
+        forward_trajectory_files=fwd_files_final, reverse_trajectory_files=rev_files_final,
+        forward_path_file=fwd_path, reverse_path_file=rev_path,
+        protocol_k=protocol_k_fwd, protocol_mode="linear_v4_chunked",
+        connectivity={}, mts_patch_built=False, cft_summary={},
+    )
+    write_json(root / "segment_summary.json", {
+        "name": name,
+        "left_boundary": left_boundary.name,
+        "right_boundary": right_boundary.name,
+        "protocol_mode": "linear_v4_chunked",
+        "segment_layout": "single_directory_bidirectional_chunked",
+        "n_forward_trajs": len(fwd_trajs_final),
+        "n_reverse_trajs": len(rev_trajs_final),
+        "actual_t_neq_used": actual_t_neq_used,
+        "fraction_used": fraction_used,
+        "n_chunks_run": n_chunks_run,
+        "stopped_early": stopped_early,
+        "k_interpolation": proto.get("k_interpolation", ""),
+        "k_mid_scale": proto.get("k_mid_scale", ""),
+    })
+
+    # Write chunk diagnostics.
+    if chunk_rows:
+        diag_cols = [
+            "generation", "chunk_index", "chunk_start", "chunk_end",
+            "actual_t_neq_used", "fraction", "checkpoint_in", "checkpoint_out",
+            "fwd_mean", "rev_mean", "fwd_q05", "fwd_q50", "fwd_q95",
+            "rev_q05", "rev_q50", "rev_q95", "fronts_overlapped",
+            "left_target_mean", "left_target_reached",
+            "right_target_mean", "right_target_reached",
+            "cft_attempted", "cft_solved", "mts_solved",
+            "left_fit_valid", "right_fit_valid",
+            "left_design_valid", "right_design_valid",
+            "left_design_source", "right_design_source",
+            "chunk_cost", "cumulative_neq_cost", "reason",
+        ]
+        write_csv(diag_dir / "neq_chunk_diagnostics.csv", diag_cols, chunk_rows)
+
+    write_json(diag_dir / "early_child_design_summary.json", {
+        "generation": generation,
+        "mode": "early-truncate",
+        "simulator_level_early_stop": True,
+        "left_frontier": left_boundary.name,
+        "right_frontier": right_boundary.name,
+        "left_target_mean": left_target_mean,
+        "left_target_sigma": left_target_sigma,
+        "right_target_mean": right_target_mean,
+        "right_target_sigma": right_target_sigma,
+        "left_design_source": left_design_source,
+        "right_design_source": right_design_source,
+        "actual_t_neq_used": actual_t_neq_used,
+        "fraction_used": fraction_used,
+        "n_chunks_run": n_chunks_run,
+        "stopped_early": stopped_early,
+        "left_final_x_child": float(left_design_final["x_child"]),
+        "left_final_k_child": float(left_design_final["k_child"]),
+        "right_final_x_child": float(right_design_final["x_child"]),
+        "right_final_k_child": float(right_design_final["k_child"]),
+        "fallback_reasons": fallback_reasons,
+    })
+
+    return {
+        "segment": seg,
+        "left_design": left_design_final,
+        "right_design": right_design_final,
+        "left_design_source": left_design_source,
+        "right_design_source": right_design_source,
+        "actual_t_neq_used": actual_t_neq_used,
+        "fraction_used": fraction_used,
+        "n_chunks_run": n_chunks_run,
+        "chunk_rows": chunk_rows,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Robust protocol path reading (supports 'x0' and 'center_x')
 # ---------------------------------------------------------------------------
 
@@ -2742,12 +3153,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quick-test", action="store_true")
     parser.add_argument(
         "--nes-child-placement-mode",
-        choices=["full", "early-truncate"],
+        choices=["full", "early-truncate", "early-truncate-prefix-analysis"],
         default="full",
         help=(
-            "Child placement strategy. 'full' keeps the current MiNES v4 behavior. "
-            "'early-truncate' runs bidirectional NES in fractions and stops once "
-            "overlapping NEQ frontiers allow MTS-assisted child placement."
+            "Child placement strategy. "
+            "'full': standard MiNES v4 behavior, full NES protocol. "
+            "'early-truncate': true simulator-level chunked NES; physically stops early "
+            "once overlapping NEQ frontiers allow MTS-assisted child placement; budget "
+            "charged per chunk. "
+            "'early-truncate-prefix-analysis': legacy mode — simulator runs full NES then "
+            "analyses trajectory prefixes analytically; budget charged at full NEQ cost."
         ),
     )
     parser.add_argument(
@@ -2877,6 +3292,36 @@ def main() -> None:
 
         _early: dict[str, Any] | None = None
         if str(args.nes_child_placement_mode) == "early-truncate":
+            # True simulator-level chunked NES.  Budget charged per chunk inside
+            # run_neq_segment_v4_chunked_until_child_ready; do NOT pre-charge here.
+            _et_seg_name = (
+                f"early_seg_L{left_frontier.name}_R{right_frontier.name}_gen{generation}"
+            )
+            _early = run_neq_segment_v4_chunked_until_child_ready(
+                name=_et_seg_name,
+                left_boundary=left_frontier,
+                right_boundary=right_frontier,
+                left_source=left_frontier,
+                right_source=right_frontier,
+                bin_path=bin_path,
+                ctx=ctx,
+                args=args,
+                grid=grid,
+                profile=profile,
+                beta_eff=beta_eff,
+                seed=seed + 100 + generation,
+                root=out_root / "segments" / _et_seg_name,
+                k_min=float(args.k_min),
+                k_max=float(args.k_max),
+                budget=budget,
+                generation=generation,
+                out_root=out_root,
+            )
+            seg = _early["segment"]
+            left_design = _early["left_design"]
+            right_design = _early["right_design"]
+        elif str(args.nes_child_placement_mode) == "early-truncate-prefix-analysis":
+            # Legacy mode: full NES + posthoc prefix analysis.  Budget pre-charged.
             _et_seg_name = (
                 f"early_seg_L{left_frontier.name}_R{right_frontier.name}_gen{generation}"
             )
@@ -2937,8 +3382,19 @@ def main() -> None:
         # Augment designs with placement metadata for generation_summary.csv
         for _d in [left_design, right_design]:
             _d["nes_child_placement_mode"] = str(args.nes_child_placement_mode)
-            _d["prefix_n_time_used"] = _early.get("prefix_n_time_used", "") if _early else ""
-            _d["fraction_used"] = _early.get("fraction_used", "") if _early else ""
+            if _early is not None:
+                # actual_t_neq_used: chunked mode sets this directly; prefix-analysis uses
+                # prefix_n_time_used as a proxy.
+                _d["actual_t_neq_used"] = _early.get(
+                    "actual_t_neq_used",
+                    _early.get("prefix_n_time_used", ""),
+                )
+                _d["fraction_used"] = _early.get("fraction_used", "")
+                _d["n_chunks_run"] = _early.get("n_chunks_run", "")
+            else:
+                _d["actual_t_neq_used"] = ""
+                _d["fraction_used"] = ""
+                _d["n_chunks_run"] = ""
         left_design["design_source"] = (
             _early.get("left_design_source", "gt_fallback") if _early else "full"
         )
