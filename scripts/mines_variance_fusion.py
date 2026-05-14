@@ -218,13 +218,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alpha", default=2.0, type=float)
     parser.add_argument("--x-leap", default=1.5, type=float)
     parser.add_argument("--k-min", default=1.0, type=float)
-    parser.add_argument("--k-max", default=50.0, type=float)
+    parser.add_argument("--k-max", default=100.0, type=float)
     parser.add_argument("--k-rescue", default=10.0, type=float)
     parser.add_argument("--js-threshold", default=0.3, type=float)
     parser.add_argument("--neq-connectivity-threshold", default=0.3, type=float)
     parser.add_argument("--bin-width", default=0.1, type=float)
     parser.add_argument("--max-generations", default=10, type=int)
-    parser.add_argument("--max-rescue-rounds", default=5, type=int)
+    parser.add_argument(
+        "--max-rescue-rounds",
+        default=None,
+        type=int,
+        help="Deprecated. Kept only for backward compatibility; final EQ refinement is budget-limited instead.",
+    )
+    parser.add_argument(
+        "--final-refinement-mode",
+        choices=["none", "eq-extend"],
+        default="eq-extend",
+        help="Final refinement after all EQ ensembles are connected. eq-extend extends existing EQ windows until target MBAR ddF or budget exhaustion.",
+    )
+    parser.add_argument(
+        "--target-mbar-ddf",
+        default=1.0e-3,
+        type=float,
+        help="Target maximum connected-EQ MBAR uncertainty (sqrt(variance)) for final EQ-extension refinement.",
+    )
+    parser.add_argument(
+        "--eq-extension-steps",
+        default=None,
+        type=int,
+        help="Additional EQ steps per selected window per final EQ-extension round. If None, uses --n-eq-steps.",
+    )
     parser.add_argument("--n-bootstrap-eq", default=64, type=int)
     parser.add_argument("--n-bootstrap-neq", default=64, type=int)
     parser.add_argument("--variance-floor", default=1.0e-6, type=float)
@@ -288,7 +311,7 @@ def apply_quick_test_overrides(args: argparse.Namespace) -> argparse.Namespace:
     args.t_neq = 200
     args.n_neq_traj = 10
     args.max_generations = 1
-    args.max_rescue_rounds = 0
+    args.final_refinement_mode = "none"
     args.n_bootstrap_eq = 8
     args.n_bootstrap_neq = 8
     args.total_budget_steps = 20000
@@ -3842,6 +3865,233 @@ def build_eq_pmf_with_neq_variance(
     return result
 
 
+def eq_network_is_connected(clusters: "list[EQCluster]") -> bool:
+    """Return True when all EQ windows have merged into one connected EQ cluster."""
+    return len(clusters) == 1
+
+
+def fallback_after_eq_connectivity_lost(
+    *,
+    clusters: "list[EQCluster]",
+    windows: "list[EnsembleWindow]",
+    out_root: "Path",
+) -> None:
+    """Seed more windows or NEQ bridges when final extension splits the EQ cluster.
+
+    TODO: implement EQ-based or NEQ-based fallback refinement here.
+    Currently writes diagnostics and returns; the main workflow marks the run as not converged.
+    """
+    write_json(out_root / "eq_connectivity_lost.json", {
+        "n_clusters_after_extension": len(clusters),
+        "cluster_names": [c.name for c in clusters],
+        "n_windows": len(windows),
+    })
+
+
+def run_final_eq_extension_refinement(
+    *,
+    windows: "list[EnsembleWindow]",
+    clusters: "list[EQCluster]",
+    segment_store: "dict[tuple[str, str], NEQSegment]",
+    neq_patch_store: "dict[str, PMFPatch]",
+    neq_patch_status: "dict[str, dict[str, Any]]",
+    patches_for_global: "list[PMFPatch]",
+    skipped_segment_rows: "list[dict[str, Any]]",
+    args: "argparse.Namespace",
+    ctx: "dict[str, Any]",
+    grid: "np.ndarray",
+    out_root: "Path",
+    bin_path: str,
+    budget: "BudgetTracker",
+    timing_rows: "list[dict[str, Any]]",
+    quality_rows: "list[dict[str, Any]]",
+    global_pmf: "np.ndarray",
+    global_variance: "np.ndarray",
+    fit_details: "dict[str, Any]",
+    js_rows: "list[dict[str, Any]]",
+    analysis_xmin: float,
+    analysis_xmax: float,
+) -> "tuple[list[EQCluster], list[PMFPatch], np.ndarray, np.ndarray, dict[str, Any], list[dict[str, Any]], list[PMFPatch], list[dict[str, Any]]]":
+    """Run final EQ-extension refinement until target MBAR ddF or budget exhaustion.
+
+    Returns (clusters, patches, global_pmf, global_variance, fit_details, js_rows,
+             patches_for_global, extension_summary_rows).
+    """
+    _EXT_SUMMARY_COLS = [
+        "round", "used_steps", "remaining_steps", "n_selected_windows",
+        "eq_extension_steps", "round_cost", "max_mbar_ddf", "x_at_max_mbar_ddf",
+        "target_mbar_ddf", "stop_reason", "n_clusters_after_extension",
+    ]
+    ext_rows: list[dict[str, Any]] = []
+
+    def _write_empty_summary(reason: str) -> None:
+        ext_rows.append({
+            "round": 0, "used_steps": int(budget.used_steps),
+            "remaining_steps": int(budget.total_budget_steps - budget.used_steps),
+            "n_selected_windows": 0, "eq_extension_steps": 0,
+            "round_cost": 0, "max_mbar_ddf": float("nan"),
+            "x_at_max_mbar_ddf": float("nan"),
+            "target_mbar_ddf": float(args.target_mbar_ddf),
+            "stop_reason": reason,
+            "n_clusters_after_extension": len(clusters),
+        })
+        write_csv(out_root / "final_eq_extension_summary.csv", _EXT_SUMMARY_COLS, ext_rows)
+
+    if getattr(args, "final_refinement_mode", "none") != "eq-extend":
+        _write_empty_summary("mode_disabled")
+        return clusters, patches_for_global, global_pmf, global_variance, fit_details, js_rows, patches_for_global, ext_rows
+
+    if not eq_network_is_connected(clusters):
+        _write_empty_summary("eq_network_not_connected")
+        return clusters, patches_for_global, global_pmf, global_variance, fit_details, js_rows, patches_for_global, ext_rows
+
+    eq_ext_steps = int(getattr(args, "eq_extension_steps", None) or args.n_eq_steps)
+    target_ddf = float(getattr(args, "target_mbar_ddf", 1.0e-3))
+    ext_root = out_root / "final_eq_extension"
+    ext_root.mkdir(parents=True, exist_ok=True)
+    base_seed = int(args.seed)
+    round_index = 0
+
+    analysis_mask = (
+        (grid >= float(analysis_xmin))
+        & (grid <= float(analysis_xmax))
+        & np.isfinite(global_variance)
+    )
+
+    def _compute_max_mbar_ddf(gvar: np.ndarray) -> tuple[float, float]:
+        valid = analysis_mask & np.isfinite(gvar) & (gvar >= 0.0)
+        if not valid.any():
+            return float("nan"), float("nan")
+        ddf_arr = np.sqrt(gvar[valid])
+        idx = int(np.argmax(ddf_arr))
+        return float(ddf_arr[idx]), float(grid[valid][idx])
+
+    while True:
+        max_ddf, x_at_max = _compute_max_mbar_ddf(global_variance)
+        selected_windows = list(clusters[0].windows)
+        round_cost = len(selected_windows) * eq_ext_steps
+        remaining = int(budget.total_budget_steps) - int(budget.used_steps)
+
+        summary_row: dict[str, Any] = {
+            "round": round_index,
+            "used_steps": int(budget.used_steps),
+            "remaining_steps": remaining,
+            "n_selected_windows": len(selected_windows),
+            "eq_extension_steps": eq_ext_steps,
+            "round_cost": round_cost,
+            "max_mbar_ddf": max_ddf,
+            "x_at_max_mbar_ddf": x_at_max,
+            "target_mbar_ddf": target_ddf,
+            "stop_reason": "",
+            "n_clusters_after_extension": 1,
+        }
+
+        if np.isfinite(max_ddf) and max_ddf < target_ddf:
+            summary_row["stop_reason"] = "target_mbar_ddf_reached"
+            ext_rows.append(summary_row)
+            break
+
+        if not budget.can_spend(round_cost):
+            summary_row["stop_reason"] = "budget_exhausted"
+            ext_rows.append(summary_row)
+            break
+
+        round_root = ext_root / f"round_{round_index:03d}"
+        round_root.mkdir(parents=True, exist_ok=True)
+
+        for wi, window in enumerate(selected_windows):
+            ext_win_root = round_root / "windows" / window.name
+            ext_win_root.mkdir(parents=True, exist_ok=True)
+            ext_seed = base_seed + 200000 + round_index * 10000 + wi
+            nout = max(1, int(math.ceil(float(eq_ext_steps) / max(int(args.eq_save_every), 1))))
+            run_eq_window_raw(
+                bin_path=bin_path,
+                ctx=ctx,
+                center_x=float(window.center_x),
+                k=float(window.k),
+                steps=eq_ext_steps,
+                nout=nout,
+                seed=ext_seed,
+                out_dir=ext_win_root,
+            )
+            ext_eq_file = ext_win_root / "eq_window.csv"
+            ext_eq_rows = read_csv_rows(ext_eq_file)
+            ext_tail_rows = tail_rows_from_eq_rows(ext_eq_rows, float(args.tail_fraction))
+            ext_tail_file = ext_win_root / "eq_tail.csv"
+            write_csv(ext_tail_file, ordered_fieldnames(ext_eq_rows or window.eq_rows), ext_tail_rows)
+            combined_tail_rows = list(window.tail_rows) + list(ext_tail_rows)
+            combined_tail_file = round_root / "windows" / window.name / "eq_tail_combined.csv"
+            write_csv(combined_tail_file, ordered_fieldnames(combined_tail_rows), combined_tail_rows)
+            window.tail_rows = combined_tail_rows
+            window.tail_file = combined_tail_file
+            tail_x_arr = np.asarray(
+                [float(r["x"]) for r in combined_tail_rows if r.get("x", "") != ""],
+                dtype=float,
+            )
+            tail_x_finite = tail_x_arr[np.isfinite(tail_x_arr)]
+            if tail_x_finite.size >= 2:
+                window.mean_x = float(np.mean(tail_x_finite))
+                window.std_x = float(np.std(tail_x_finite, ddof=1))
+                window.x_most = float(mode_x_from_samples(tail_x_finite, grid))
+
+        budget.spend(round_cost, f"final_eq_extension_round_{round_index:03d}", "EQ_EXTENSION", "final_eq_extension")
+
+        stage_label = f"final_eq_extension_round_{round_index:03d}"
+        with timed_operation(timing_rows, stage=stage_label, operation="rebuild_clusters_and_pmf", item="all"):
+            new_clusters, new_js_rows = build_eq_clusters(windows, grid, float(args.js_threshold), ctx=ctx)
+            patch_root_ext = round_root / "patches"
+            new_patches: list[PMFPatch] = []
+            for ci, cl in enumerate(new_clusters):
+                new_patches.append(
+                    build_eq_cluster_patch(
+                        cl, grid, ctx, int(args.n_bootstrap_eq), patch_root_ext,
+                        rng_seed=base_seed + 300000 + round_index * 1000 + ci,
+                    )
+                )
+            new_global_pmf, new_global_variance, new_fit_details = fit_global_pmf_from_patches(
+                new_patches, grid, float(args.variance_floor), reference_x=None,
+            )
+
+        if not eq_network_is_connected(new_clusters):
+            summary_row["stop_reason"] = "eq_connectivity_lost"
+            summary_row["n_clusters_after_extension"] = len(new_clusters)
+            ext_rows.append(summary_row)
+            write_csv(out_root / "final_eq_extension_summary.csv", _EXT_SUMMARY_COLS, ext_rows)
+            return clusters, patches_for_global, global_pmf, global_variance, fit_details, js_rows, patches_for_global, ext_rows
+
+        clusters = new_clusters
+        js_rows = new_js_rows
+        patches_for_global = new_patches
+        global_pmf = new_global_pmf
+        global_variance = new_global_variance
+        fit_details = new_fit_details
+
+        all_segs_sorted = sorted(segment_store.values(), key=lambda s: s.name)
+        write_state_tables(
+            round_root, out_root, windows, clusters, all_segs_sorted,
+            patches_for_global, fit_details, js_rows, grid, global_pmf, global_variance, ctx,
+        )
+
+        quality_rows.append(compute_pmf_quality_metrics(
+            grid=grid, global_pmf=global_pmf, global_variance=global_variance,
+            ctx=ctx, used_steps=int(budget.used_steps), stage=stage_label,
+            analysis_xmin=float(analysis_xmin), analysis_xmax=float(analysis_xmax),
+        ))
+
+        analysis_mask = (
+            (grid >= float(analysis_xmin))
+            & (grid <= float(analysis_xmax))
+            & np.isfinite(global_variance)
+        )
+        summary_row["stop_reason"] = "round_complete"
+        ext_rows.append(summary_row)
+        write_csv(out_root / "final_eq_extension_summary.csv", _EXT_SUMMARY_COLS, ext_rows)
+        round_index += 1
+
+    write_csv(out_root / "final_eq_extension_summary.csv", _EXT_SUMMARY_COLS, ext_rows)
+    return clusters, patches_for_global, global_pmf, global_variance, fit_details, js_rows, patches_for_global, ext_rows
+
+
 def reconstruct_chain(
     *,
     windows: list[EnsembleWindow],
@@ -4058,23 +4308,40 @@ def reconstruct_chain(
     eq_patches_current = [p for p in patches if p.kind == "EQ_MBAR"]
     # Use ALL stored NEQ patches (not just ones built this round)
     neq_patches_from_store = [p for p in neq_patch_store.values() if int(np.count_nonzero(p.coverage_mask)) > 0]
-    if pmf_method == "neq":
-        if not neq_patches_from_store:
-            raise RuntimeError(
-                "pmf_method=neq but no NEQ_MTS patches are available. "
-                "Check that NEQ simulations ran and produced valid patches."
-            )
-        patches_for_global = neq_patches_from_store
-    elif pmf_method == "hybrid":
-        patches_for_global = eq_patches_current + neq_patches_from_store
-    elif pmf_method == "eq":
-        patches_for_global = build_eq_pmf_with_neq_variance(
-            eq_patches=eq_patches_current,
-            neq_patches=neq_patches_from_store,
-            grid=grid,
-        )
+    # When all EQ windows form one connected cluster, use EQ-MBAR only.
+    # NEQ/MTS patches are excluded from the global PMF fit and retained only for diagnostics.
+    if eq_network_is_connected(clusters):
+        patches_for_global = eq_patches_current
+        patch_selection_rule = "connected_EQ_MBAR_only"
+        variance_source = "EQ_MBAR_bootstrap"
     else:
-        raise ValueError(f"Unknown pmf_method: {pmf_method!r}")
+        if pmf_method == "neq":
+            if not neq_patches_from_store:
+                raise RuntimeError(
+                    "pmf_method=neq but no NEQ_MTS patches are available. "
+                    "Check that NEQ simulations ran and produced valid patches."
+                )
+            patches_for_global = neq_patches_from_store
+        elif pmf_method == "hybrid":
+            patches_for_global = eq_patches_current + neq_patches_from_store
+        elif pmf_method == "eq":
+            patches_for_global = build_eq_pmf_with_neq_variance(
+                eq_patches=eq_patches_current,
+                neq_patches=neq_patches_from_store,
+                grid=grid,
+            )
+        else:
+            raise ValueError(f"Unknown pmf_method: {pmf_method!r}")
+        patch_selection_rule = {
+            "neq": "only_NEQ_MTS",
+            "hybrid": "EQ_MBAR_plus_NEQ_MTS",
+            "eq": "EQ_MBAR_pmf_with_EQ_NEQ_variance",
+        }[pmf_method]
+        variance_source = {
+            "neq": "NEQ_MTS_bootstrap",
+            "hybrid": "hybrid_patch_variance",
+            "eq": "EQ_NEQ_variance",
+        }[pmf_method]
     # Classify all stored NEQ patches against current cluster graph
     _current_neighbor_names = {s.name for s in segments}
     _window_to_cluster = build_window_to_cluster_map(clusters)
@@ -4098,17 +4365,6 @@ def reconstruct_chain(
             "n_covered_bins": int(np.count_nonzero(_stored_patch.coverage_mask)),
         })
 
-    patch_selection_rule = {
-        "neq": "only_NEQ_MTS",
-        "hybrid": "EQ_MBAR_plus_NEQ_MTS",
-        "eq": "EQ_MBAR_pmf_with_EQ_NEQ_variance",
-    }[pmf_method]
-    variance_source = {
-        "neq": "NEQ_MTS_bootstrap",
-        "hybrid": "hybrid_patch_variance",
-        "eq": "EQ_NEQ_variance",
-    }[pmf_method]
-
     with timed_operation(
         _timing,
         stage=stage_label,
@@ -4125,6 +4381,10 @@ def reconstruct_chain(
     fit_details["pmf_method"] = pmf_method
     fit_details["patch_selection_rule"] = patch_selection_rule
     fit_details["variance_source"] = variance_source
+    fit_details["eq_network_connected"] = bool(eq_network_is_connected(clusters))
+    fit_details["final_estimator"] = (
+        "connected_EQ_MBAR_only" if eq_network_is_connected(clusters) else "provisional_fused_pmf"
+    )
     write_patch_offset_aligned_outputs(patches_for_global, fit_details)
     write_all_neq_patches_csv(out_root, neq_patch_store, neq_patch_status, out_root)
     write_patches_used_for_global_fit_csv(out_root, patches_for_global, fit_details, neq_patch_store, neq_patch_status, out_root)
@@ -6263,7 +6523,7 @@ def main() -> None:
     budget.write(out_root / "budget_ledger.csv")
 
     rescue_counter = 0
-    while rescue_counter < int(args.max_rescue_rounds):
+    while args.max_rescue_rounds is None or rescue_counter < int(args.max_rescue_rounds):
         target_info: dict[str, Any] | None = None
         with timed_operation(
             timing_rows,
@@ -6604,6 +6864,43 @@ def main() -> None:
             [],
         )
 
+    (
+        clusters,
+        patches_for_global,
+        global_pmf,
+        global_variance,
+        fit_details,
+        js_rows,
+        _,
+        _ext_rows,
+    ) = run_final_eq_extension_refinement(
+        windows=windows,
+        clusters=clusters,
+        segment_store=segment_store,
+        neq_patch_store=neq_patch_store,
+        neq_patch_status=neq_patch_status,
+        patches_for_global=patches_for_global,
+        skipped_segment_rows=skipped_segment_rows,
+        args=args,
+        ctx=ctx,
+        grid=grid,
+        out_root=out_root,
+        bin_path=bin_path,
+        budget=budget,
+        timing_rows=timing_rows,
+        quality_rows=quality_rows,
+        global_pmf=global_pmf,
+        global_variance=global_variance,
+        fit_details=fit_details,
+        js_rows=js_rows,
+        analysis_xmin=float(analysis_xmin),
+        analysis_xmax=float(analysis_xmax),
+    )
+
+    _last_ext_reason = _ext_rows[-1].get("stop_reason", "") if _ext_rows else ""
+    if _last_ext_reason == "eq_connectivity_lost":
+        fallback_after_eq_connectivity_lost(clusters=clusters, windows=windows, out_root=out_root)
+
     budget.write(out_root / "budget_ledger.csv")
 
     all_segments_sorted = sorted(segment_store.values(), key=lambda item: item.name)
@@ -6724,6 +7021,7 @@ def main() -> None:
             "barrier_crossing_rule": "disabled_gt_slope_aware",
             "rescue_strategy": "choose_rescue_target_priority",
             "rescue_target_rule": "uncovered_interval_first_then_failed_gap_then_max_finite_variance",
+            "connectivity_refinement_strategy": "adaptive_connectivity_refinement",
             "neq_gt_strategy": "endpoint_local_harmonic_interpolation",
             "intercluster_boundary_rule": "existing_connected_segment_to_right_left_boundary_most_left_else_nearest_boundary",
             "coverage_rule": "actual_patch_data_support",

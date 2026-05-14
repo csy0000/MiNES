@@ -3,7 +3,25 @@
     "allow": [
       "Bash(python3 -c \"import ast; ast.parse\\(open\\('scripts/mines_variance_fusion.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
       "Bash(python3 -c ' *)",
-      "Bash(python -m py_compile /Users/shuyuchen/Dropbox/ETH/Work/MiNES/scripts/mines_variance_fusion.py)"
+      "Bash(python -m py_compile /Users/shuyuchen/Dropbox/ETH/Work/MiNES/scripts/mines_variance_fusion.py)",
+      "Bash(python3 -m py_compile scripts/mines_variance_fusion.py)",
+      "Bash(python3 -m py_compile scripts/mines_variance_fusion_v1.py)",
+      "Bash(python3 -m py_compile scripts/mines_variance_fusion_v2.py)",
+      "Bash(python3 -m py_compile scripts/mines_variance_fusion_v3.py)",
+      "Bash(chmod +x /Users/shuyuchen/Dropbox/ETH/Work/MiNES/scripts/run_mines_variance_fusion_v4_tneq_sweep.sh)",
+      "Bash(python3 -m py_compile /Users/shuyuchen/Dropbox/ETH/Work/MiNES/scripts/mines_variance_fusion_v4.py)",
+      "Bash(echo \"py_compile exit: $?\")",
+      "Bash(python3 -)",
+      "Bash(python -c ' *)",
+      "Bash(python -m pyflakes scripts/mines_variance_fusion_v4.py)",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(list\\(d.keys\\(\\)\\)\\)\")",
+      "Bash(python -m py_compile /Users/shuyuchen/Dropbox/ETH/Work/MiNES/scripts/mines_variance_fusion_v4.py)",
+      "Bash(python -m py_compile scripts/mines_variance_fusion_v4.py)",
+      "Bash(conda info *)",
+      "Bash(simulations/cpp/neq_sim --help)",
+      "Bash(simulations/cpp/neq_sim)",
+      "Bash(conda run *)",
+      "Bash(xargs -I{} sh -c 'echo \"=== {} ===\" && cat {}')"
     ]
   }
 }

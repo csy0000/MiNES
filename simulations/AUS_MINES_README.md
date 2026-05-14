@@ -1,6 +1,16 @@
-# Benchmark Method Workflows
+# OBSOLETE NOTE
 
-This note explains how the current 1D benchmark methods work in the runner:
+This document describes the **legacy** MiNES milestone-chain workflow using `simulations/adaptive_methods.py`.
+The current MiNES implementation uses `scripts/mines_variance_fusion.py` and has a substantially different design.
+See `README.md` and `docs/current_mines_protocol.md` for the current protocol.
+
+**Do not use this file for current implementation decisions.**
+
+---
+
+# Benchmark Method Workflows (Legacy)
+
+This note explains how the legacy 1D benchmark methods worked in the runner:
 
 - `US` = fixed-window umbrella sampling
 - `AUS` = adaptive umbrella sampling
