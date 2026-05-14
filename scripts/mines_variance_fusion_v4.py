@@ -60,6 +60,8 @@ from adaptive_methods import (  # type: ignore  # noqa: E402
 )
 from bidirectional_mts_pmf import (  # type: ignore  # noqa: E402
     bootstrap_bidirectional_mts_pmf,
+    build_bidirectional_mts_pmf,
+    estimate_intermediate_reduced_free_energies,
     solve_segment_cft_delta_f_once,
     trajectory_frames_to_arrays,
 )
@@ -730,6 +732,471 @@ def design_mts_barrier_gt_window(
     }
     result.update(sigma_meta)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Early-truncating NES child placement helpers
+# ---------------------------------------------------------------------------
+
+def direction_reached(value: float, target: float, direction: str) -> bool:
+    if direction == "right":
+        return float(value) >= float(target)
+    if direction == "left":
+        return float(value) <= float(target)
+    raise ValueError(f"Unknown direction: {direction}")
+
+
+def quantile_safe(x: np.ndarray, q: float) -> float:
+    arr = np.asarray(x, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan")
+    return float(np.quantile(arr, float(q)))
+
+
+def neq_frontiers_overlap(
+    x_fwd_front: np.ndarray,
+    x_rev_front: np.ndarray,
+    q_low: float = 0.05,
+    q_high: float = 0.95,
+) -> dict[str, Any]:
+    fwd_q_high = quantile_safe(x_fwd_front, q_high)
+    rev_q_low = quantile_safe(x_rev_front, q_low)
+    fwd_mean = float(np.nanmean(x_fwd_front)) if np.size(x_fwd_front) else float("nan")
+    rev_mean = float(np.nanmean(x_rev_front)) if np.size(x_rev_front) else float("nan")
+    return {
+        "fwd_mean": fwd_mean,
+        "rev_mean": rev_mean,
+        "fwd_q05": quantile_safe(x_fwd_front, 0.05),
+        "fwd_q50": quantile_safe(x_fwd_front, 0.50),
+        "fwd_q95": quantile_safe(x_fwd_front, 0.95),
+        "rev_q05": quantile_safe(x_rev_front, 0.05),
+        "rev_q50": quantile_safe(x_rev_front, 0.50),
+        "rev_q95": quantile_safe(x_rev_front, 0.95),
+        "fronts_overlapped": bool(
+            math.isfinite(fwd_q_high)
+            and math.isfinite(rev_q_low)
+            and fwd_q_high >= rev_q_low
+        ),
+    }
+
+
+def build_neq_mts_prefix_pmf_no_bootstrap_v4(
+    *,
+    segment: "NEQSegment",
+    grid: np.ndarray,
+    ctx: dict[str, Any],
+    prefix_n_time: int,
+) -> dict[str, Any]:
+    """No-bootstrap MTS PMF on a truncated trajectory prefix for child placement.
+
+    First implementation note:
+    The simulator still produces full trajectories. Early truncation is applied
+    analytically by selecting a prefix for CFT/MTS and child placement.
+    Budget accounting therefore still charges the full NEQ cost.
+    True simulator-level early stopping can be added later.
+    """
+    nan = np.full(len(grid), np.nan, dtype=float)
+    try:
+        fwd_frames = [pd.DataFrame(rows) for rows in segment.forward_trajectories]
+        rev_frames = [pd.DataFrame(rows) for rows in segment.reverse_trajectories]
+        x_fwd, work_fwd = trajectory_frames_to_arrays(fwd_frames)
+        x_rev, work_rev = trajectory_frames_to_arrays(rev_frames)
+    except Exception as exc:
+        return {"mts_solved": False, "cft_solved": False,
+                "reason": f"trajectory_load_error: {exc}", "grid": grid, "pmf": nan}
+
+    centers, ks = read_protocol_centers_and_k(segment.forward_path_file)
+
+    n_time_available = min(
+        x_fwd.shape[1] if x_fwd.ndim == 2 else 0,
+        work_fwd.shape[1] if work_fwd.ndim == 2 else 0,
+        x_rev.shape[1] if x_rev.ndim == 2 else 0,
+        work_rev.shape[1] if work_rev.ndim == 2 else 0,
+        len(centers), len(ks),
+    )
+    nt = max(2, min(int(prefix_n_time), n_time_available))
+    if nt <= 0:
+        return {"mts_solved": False, "cft_solved": False,
+                "reason": "no_time_slices", "grid": grid, "pmf": nan}
+
+    x_fwd_p = x_fwd[:, :nt]
+    work_fwd_p = work_fwd[:, :nt]
+    x_rev_p = x_rev[:, :nt]
+    work_rev_p = work_rev[:, :nt]
+    centers_p = centers[:nt]
+    ks_p = ks[:nt]
+
+    kT = float(ctx.get("thermal_kT", 1.0))
+    cft = solve_segment_cft_delta_f_once(work_fwd_p, work_rev_p, kT=kT)
+    cft_solved = bool(cft.get("cft_solved", False))
+    delta_f_raw = cft.get("delta_f")
+    finite_df = cft_solved and delta_f_raw is not None and math.isfinite(float(delta_f_raw))
+    if not finite_df:
+        return {"mts_solved": False, "cft_solved": cft_solved,
+                "reason": "cft_not_solved_or_nonfinite_delta_f", "grid": grid, "pmf": nan}
+
+    delta_f = float(delta_f_raw)
+    try:
+        reverse_prefix = work_rev_p[:, ::-1][:, :nt]
+        _, _, fk, _, _, _ = estimate_intermediate_reduced_free_energies(
+            work_fwd_p, reverse_prefix, delta_f, n_boot=4, rng_seed=0,
+        )
+        pmf = build_bidirectional_mts_pmf(
+            x_fwd_p, work_fwd_p, x_rev_p, work_rev_p,
+            centers_p, ks_p, grid, fk[:nt], delta_f, kT=kT,
+        )
+        mts_solved = bool(np.any(np.isfinite(pmf)))
+    except Exception as exc:
+        return {"mts_solved": False, "cft_solved": True,
+                "reason": f"mts_build_error: {exc}", "grid": grid, "pmf": nan,
+                "delta_f": delta_f, "prefix_n_time": int(nt)}
+
+    return {
+        "mts_solved": mts_solved,
+        "cft_solved": True,
+        "delta_f": delta_f,
+        "grid": grid,
+        "pmf": np.asarray(pmf, dtype=float),
+        "prefix_n_time": int(nt),
+        "reason": "" if mts_solved else "mts_pmf_all_nan",
+    }
+
+
+def fit_local_mts_background_for_target(
+    *,
+    grid: np.ndarray,
+    pmf: np.ndarray,
+    target_mean: float,
+    target_sigma: float,
+    halfwidth_sigma: float,
+    min_points: int,
+) -> dict[str, Any]:
+    """Fit a local quadratic background PMF near target_mean."""
+    x = np.asarray(grid, dtype=float)
+    f = np.asarray(pmf, dtype=float)
+    window = float(halfwidth_sigma) * max(float(target_sigma), 1e-12)
+    ok = np.isfinite(x) & np.isfinite(f) & (np.abs(x - float(target_mean)) <= window)
+    n = int(np.sum(ok))
+    if n < int(min_points):
+        return {"fit_valid": False, "k_bg": "", "x_bg": "",
+                "n_fit_points": n, "fit_reason": f"too_few_points_{n}_lt_{min_points}"}
+    x_fit = x[ok]
+    f_fit = f[ok]
+    A = np.column_stack([x_fit ** 2, x_fit, np.ones(n)])
+    try:
+        coeffs, _, _, _ = np.linalg.lstsq(A, f_fit, rcond=None)
+    except Exception as exc:
+        return {"fit_valid": False, "k_bg": "", "x_bg": "",
+                "n_fit_points": n, "fit_reason": f"lstsq_failed: {exc}"}
+    a, b = float(coeffs[0]), float(coeffs[1])
+    if abs(a) < 1e-14:
+        return {"fit_valid": False, "k_bg": "", "x_bg": "",
+                "n_fit_points": n, "fit_reason": "degenerate_quadratic_a_near_zero"}
+    k_bg = 2.0 * a
+    x_bg = -b / (2.0 * a)
+    if not (math.isfinite(k_bg) and math.isfinite(x_bg)):
+        return {"fit_valid": False, "k_bg": "", "x_bg": "",
+                "n_fit_points": n, "fit_reason": "nonfinite_fit_parameters"}
+    return {"fit_valid": True, "k_bg": float(k_bg), "x_bg": float(x_bg),
+            "n_fit_points": n, "fit_reason": "quadratic_local_mts_fit"}
+
+
+def design_child_from_background_fit(
+    *,
+    target_mean: float,
+    target_sigma: float,
+    k_bg: float,
+    x_bg: float,
+    beta_eff: float,
+    k_min: float,
+    k_max: float,
+) -> dict[str, Any]:
+    """Derive EQ bias parameters from target mean/sigma and a local background fit."""
+    k_total = 1.0 / (max(float(beta_eff), 1e-12) * max(float(target_sigma), 1e-12) ** 2)
+    k_raw = k_total - float(k_bg)
+    if not math.isfinite(k_raw) or abs(k_raw) < 1e-12:
+        return {"design_valid": False, "design_reason": "k_raw_nonfinite_or_near_zero",
+                "target_mean": float(target_mean), "target_sigma": float(target_sigma),
+                "k_total_target": float(k_total), "k_bg": float(k_bg), "x_bg": float(x_bg),
+                "k_raw": "", "k_child": "", "k_clipped": "", "x_child": ""}
+    k_child = float(np.clip(k_raw, float(k_min), float(k_max)))
+    k_clipped = int(k_child != k_raw)
+    x_child = (
+        float(target_mean) + float(k_bg) * (float(target_mean) - float(x_bg)) / k_child
+        if abs(k_child) > 1e-12 else float(target_mean)
+    )
+    if not math.isfinite(x_child):
+        x_child = float(target_mean)
+    return {
+        "design_valid": True,
+        "target_mean": float(target_mean), "target_sigma": float(target_sigma),
+        "k_total_target": float(k_total), "k_bg": float(k_bg), "x_bg": float(x_bg),
+        "k_raw": float(k_raw), "k_child": float(k_child), "k_clipped": k_clipped,
+        "x_child": float(x_child), "design_reason": "",
+    }
+
+
+def run_early_truncating_nes_child_placement_v4(
+    *,
+    generation: int,
+    left_frontier: "EnsembleWindow",
+    right_frontier: "EnsembleWindow",
+    seg_name: str,
+    seg_root: Path,
+    profile: "GlobalGTWidthProfile",
+    args: "argparse.Namespace",
+    ctx: dict[str, Any],
+    grid: np.ndarray,
+    out_root: Path,
+    bin_path: str,
+    beta_eff: float,
+    seed: int,
+) -> dict[str, Any]:
+    """Early-truncating bidirectional NES child placement.
+
+    First implementation: simulator runs full trajectories; early truncation is
+    applied analytically for CFT/MTS prefix analysis. Budget is charged at full
+    NEQ cost by the caller.
+    """
+    # 1. GT/KL target designs for both sides
+    left_design_gt = design_child_window(
+        current_window=left_frontier, opposite_window=right_frontier,
+        profile=profile, k_min=float(args.k_min), k_max=float(args.k_max),
+        beta_eff=beta_eff, target_kl=float(args.target_kl), direction="right",
+    )
+    right_design_gt = design_child_window(
+        current_window=right_frontier, opposite_window=left_frontier,
+        profile=profile, k_min=float(args.k_min), k_max=float(args.k_max),
+        beta_eff=beta_eff, target_kl=float(args.target_kl), direction="left",
+    )
+    left_target_mean = float(left_design_gt["m_next"])
+    left_target_sigma = float(left_design_gt["sigma_next"])
+    right_target_mean = float(right_design_gt["m_next"])
+    right_target_sigma = float(right_design_gt["sigma_next"])
+
+    # 2. Run full bidirectional NES (simulator-level early stopping deferred)
+    seg = run_neq_segment_v4(
+        name=seg_name, left_boundary=left_frontier, right_boundary=right_frontier,
+        left_source=left_frontier, right_source=right_frontier,
+        bin_path=bin_path, ctx=ctx, t_neq=args.t_neq, n_neq_traj=args.n_neq_traj,
+        neq_nout=int(args.neq_nout), k_mid_scale=float(args.neq_k_mid_scale),
+        seed=seed, root=seg_root, k_min=float(args.k_min), k_max=float(args.k_max),
+    )
+
+    # 3. Convert trajectory frames to arrays
+    trajs_ok = False
+    x_fwd = work_fwd = x_rev = work_rev = None
+    try:
+        fwd_frames = [pd.DataFrame(rows) for rows in seg.forward_trajectories]
+        rev_frames = [pd.DataFrame(rows) for rows in seg.reverse_trajectories]
+        x_fwd, work_fwd = trajectory_frames_to_arrays(fwd_frames)
+        x_rev, work_rev = trajectory_frames_to_arrays(rev_frames)
+        trajs_ok = (
+            x_fwd.ndim == 2 and x_fwd.shape[1] >= 2
+            and x_rev.ndim == 2 and x_rev.shape[1] >= 2
+        )
+    except Exception:
+        trajs_ok = False
+
+    if not trajs_ok:
+        return {
+            "segment": seg,
+            "left_design": left_design_gt,
+            "right_design": right_design_gt,
+            "left_design_source": "gt_fallback",
+            "right_design_source": "gt_fallback",
+            "prefix_n_time_used": 0,
+            "fraction_used": 0.0,
+            "frontier_rows": [],
+        }
+
+    # 4. Prefix indices
+    n_time_available = min(x_fwd.shape[1], x_rev.shape[1])
+    fracs = np.linspace(1.0 / max(int(args.nes_fractions), 1), 1.0, int(args.nes_fractions))
+    prefix_indices = sorted(set(max(2, int(round(frac * n_time_available))) for frac in fracs))
+
+    diag_dir = out_root / "early_truncation" / f"generation_{generation}"
+    diag_dir.mkdir(parents=True, exist_ok=True)
+
+    left_mts_design: dict[str, Any] | None = None
+    right_mts_design: dict[str, Any] | None = None
+    left_design_source = "gt_fallback"
+    right_design_source = "gt_fallback"
+    nt_used_final = n_time_available
+    frac_used_final = 1.0
+    frontier_rows: list[dict[str, Any]] = []
+
+    q_low = float(args.nes_front_overlap_q_low)
+    q_high = float(args.nes_front_overlap_q_high)
+
+    # 5-12. Loop over fractions
+    for nt in prefix_indices:
+        frac = nt / n_time_available
+        x_fwd_front = x_fwd[:, nt - 1]
+        x_rev_front = x_rev[:, nt - 1]
+
+        front = neq_frontiers_overlap(x_fwd_front, x_rev_front, q_low=q_low, q_high=q_high)
+        left_target_reached = direction_reached(front["fwd_mean"], left_target_mean, "right")
+        right_target_reached = direction_reached(front["rev_mean"], right_target_mean, "left")
+
+        cft_attempted = False
+        cft_solved_frac = False
+        mts_solved_frac = False
+        left_fit_valid = False
+        right_fit_valid = False
+        left_design_valid = False
+        right_design_valid = False
+        reason = ""
+
+        if front["fronts_overlapped"]:
+            cft_attempted = True
+            mts_result = build_neq_mts_prefix_pmf_no_bootstrap_v4(
+                segment=seg, grid=grid, ctx=ctx, prefix_n_time=nt,
+            )
+            cft_solved_frac = bool(mts_result.get("cft_solved", False))
+            mts_solved_frac = bool(mts_result.get("mts_solved", False))
+            reason = str(mts_result.get("reason", ""))
+
+            if mts_solved_frac:
+                pmf_prefix = mts_result["pmf"]
+
+                if left_target_reached and left_mts_design is None:
+                    lfit = fit_local_mts_background_for_target(
+                        grid=grid, pmf=pmf_prefix,
+                        target_mean=left_target_mean, target_sigma=left_target_sigma,
+                        halfwidth_sigma=float(args.mts_local_fit_halfwidth_sigma),
+                        min_points=int(args.mts_local_fit_min_points),
+                    )
+                    left_fit_valid = bool(lfit["fit_valid"])
+                    if left_fit_valid:
+                        ld = design_child_from_background_fit(
+                            target_mean=left_target_mean, target_sigma=left_target_sigma,
+                            k_bg=float(lfit["k_bg"]), x_bg=float(lfit["x_bg"]),
+                            beta_eff=beta_eff,
+                            k_min=float(args.k_min), k_max=float(args.k_max),
+                        )
+                        left_design_valid = bool(ld["design_valid"])
+                        if left_design_valid:
+                            left_mts_design = ld
+                            left_design_source = "mts_prefix"
+
+                if right_target_reached and right_mts_design is None:
+                    rfit = fit_local_mts_background_for_target(
+                        grid=grid, pmf=pmf_prefix,
+                        target_mean=right_target_mean, target_sigma=right_target_sigma,
+                        halfwidth_sigma=float(args.mts_local_fit_halfwidth_sigma),
+                        min_points=int(args.mts_local_fit_min_points),
+                    )
+                    right_fit_valid = bool(rfit["fit_valid"])
+                    if right_fit_valid:
+                        rd = design_child_from_background_fit(
+                            target_mean=right_target_mean, target_sigma=right_target_sigma,
+                            k_bg=float(rfit["k_bg"]), x_bg=float(rfit["x_bg"]),
+                            beta_eff=beta_eff,
+                            k_min=float(args.k_min), k_max=float(args.k_max),
+                        )
+                        right_design_valid = bool(rd["design_valid"])
+                        if right_design_valid:
+                            right_mts_design = rd
+                            right_design_source = "mts_prefix"
+        else:
+            reason = "bidirectional_fronts_not_overlapped"
+
+        frontier_rows.append({
+            "generation": generation,
+            "prefix_n_time": nt,
+            "fraction": float(frac),
+            "fwd_mean": front["fwd_mean"], "rev_mean": front["rev_mean"],
+            "fwd_q05": front["fwd_q05"], "fwd_q50": front["fwd_q50"],
+            "fwd_q95": front["fwd_q95"],
+            "rev_q05": front["rev_q05"], "rev_q50": front["rev_q50"],
+            "rev_q95": front["rev_q95"],
+            "fronts_overlapped": int(front["fronts_overlapped"]),
+            "left_target_mean": left_target_mean,
+            "left_target_reached": int(left_target_reached),
+            "right_target_mean": right_target_mean,
+            "right_target_reached": int(right_target_reached),
+            "cft_attempted": int(cft_attempted),
+            "cft_solved": int(cft_solved_frac),
+            "mts_solved": int(mts_solved_frac),
+            "left_fit_valid": int(left_fit_valid),
+            "right_fit_valid": int(right_fit_valid),
+            "left_design_valid": int(left_design_valid),
+            "right_design_valid": int(right_design_valid),
+            "left_design_source": left_design_source,
+            "right_design_source": right_design_source,
+            "reason": reason,
+        })
+
+        if left_mts_design is not None and right_mts_design is not None:
+            nt_used_final = nt
+            frac_used_final = frac
+            break
+
+    # 13. Resolve final designs
+    def _mts_to_final(mts_d: dict[str, Any], gt_d: dict[str, Any], side: str) -> dict[str, Any]:
+        d = dict(mts_d)
+        d["m_next"] = d["target_mean"]
+        d["sigma_next"] = d["target_sigma"]
+        d["proposal_rule"] = "early_truncated_bidirectional_mts_local_fit"
+        d["side"] = side
+        d["parent_window"] = gt_d.get("parent_window", "")
+        d["opposite_window"] = gt_d.get("opposite_window", "")
+        d["search_direction"] = side
+        return d
+
+    left_design_final = (
+        _mts_to_final(left_mts_design, left_design_gt, "right")
+        if left_mts_design is not None else left_design_gt
+    )
+    right_design_final = (
+        _mts_to_final(right_mts_design, right_design_gt, "left")
+        if right_mts_design is not None else right_design_gt
+    )
+
+    # 14. Write diagnostics
+    diag_cols = [
+        "generation", "prefix_n_time", "fraction",
+        "fwd_mean", "rev_mean", "fwd_q05", "fwd_q50", "fwd_q95",
+        "rev_q05", "rev_q50", "rev_q95", "fronts_overlapped",
+        "left_target_mean", "left_target_reached",
+        "right_target_mean", "right_target_reached",
+        "cft_attempted", "cft_solved", "mts_solved",
+        "left_fit_valid", "right_fit_valid",
+        "left_design_valid", "right_design_valid",
+        "left_design_source", "right_design_source", "reason",
+    ]
+    write_csv(diag_dir / "neq_frontier_diagnostics.csv", diag_cols, frontier_rows)
+    write_json(diag_dir / "early_child_design_summary.json", {
+        "generation": generation,
+        "left_frontier": left_frontier.name,
+        "right_frontier": right_frontier.name,
+        "left_target_mean": left_target_mean,
+        "left_target_sigma": left_target_sigma,
+        "right_target_mean": right_target_mean,
+        "right_target_sigma": right_target_sigma,
+        "left_design_source": left_design_source,
+        "right_design_source": right_design_source,
+        "prefix_n_time_used": int(nt_used_final),
+        "fraction_used": float(frac_used_final),
+        "left_final_x_child": float(left_design_final["x_child"]),
+        "left_final_k_child": float(left_design_final["k_child"]),
+        "right_final_x_child": float(right_design_final["x_child"]),
+        "right_final_k_child": float(right_design_final["k_child"]),
+        "fallback_reasons": [r["reason"] for r in frontier_rows if not r["fronts_overlapped"]],
+    })
+
+    return {
+        "segment": seg,
+        "left_design": left_design_final,
+        "right_design": right_design_final,
+        "left_design_source": left_design_source,
+        "right_design_source": right_design_source,
+        "prefix_n_time_used": int(nt_used_final),
+        "fraction_used": float(frac_used_final),
+        "frontier_rows": frontier_rows,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2273,6 +2740,49 @@ def parse_args() -> argparse.Namespace:
         help="Midpoint k enhancement factor for the quadratic NEQ spring protocol. Default: 1.0.",
     )
     parser.add_argument("--quick-test", action="store_true")
+    parser.add_argument(
+        "--nes-child-placement-mode",
+        choices=["full", "early-truncate"],
+        default="full",
+        help=(
+            "Child placement strategy. 'full' keeps the current MiNES v4 behavior. "
+            "'early-truncate' runs bidirectional NES in fractions and stops once "
+            "overlapping NEQ frontiers allow MTS-assisted child placement."
+        ),
+    )
+    parser.add_argument(
+        "--nes-fractions",
+        default=10,
+        type=int,
+        help="Number of fractions used by early-truncating NES child placement. Default: 10.",
+    )
+    parser.add_argument(
+        "--nes-front-overlap-q-low",
+        default=0.05,
+        type=float,
+        help="Lower quantile for reverse NEQ frontier overlap test. Default: 0.05.",
+    )
+    parser.add_argument(
+        "--nes-front-overlap-q-high",
+        default=0.95,
+        type=float,
+        help="Upper quantile for forward NEQ frontier overlap test. Default: 0.95.",
+    )
+    parser.add_argument(
+        "--mts-local-fit-halfwidth-sigma",
+        default=2.5,
+        type=float,
+        help=(
+            "Half-width of local PMF fitting window in units of target sigma for "
+            "MTS-assisted child placement. Default: 2.5."
+        ),
+    )
+    parser.add_argument(
+        "--mts-local-fit-min-points",
+        default=5,
+        type=int,
+        help="Minimum number of finite PMF points required for local MTS quadratic fit. Default: 5.",
+    )
     return parser.parse_args()
 
 
@@ -2360,24 +2870,61 @@ def main() -> None:
             print(f"[v4] EQ network connected at generation {generation}. Stopping exploration.")
             break
 
-        seg_name = f"seg_L{left_frontier.name}_R{right_frontier.name}_gen{generation}"
         n_cost = neq_cost(args.n_neq_traj, args.t_neq)
         if not budget.can_spend(n_cost):
             print("[v4] Budget exhausted before NEQ at generation", generation)
             break
-        budget.spend(n_cost, seg_name, "NEQ", f"generation_{generation}")
-        seg = run_neq_segment_v4(
-            name=seg_name, left_boundary=left_frontier, right_boundary=right_frontier,
-            left_source=left_frontier, right_source=right_frontier,
-            bin_path=bin_path, ctx=ctx, t_neq=args.t_neq, n_neq_traj=args.n_neq_traj,
-            neq_nout=int(args.neq_nout), k_mid_scale=float(args.neq_k_mid_scale),
-            seed=seed + 100 + generation,
-            root=out_root / "segments" / seg_name,
-            k_min=float(args.k_min), k_max=float(args.k_max),
-        )
+
+        _early: dict[str, Any] | None = None
+        if str(args.nes_child_placement_mode) == "early-truncate":
+            _et_seg_name = (
+                f"early_seg_L{left_frontier.name}_R{right_frontier.name}_gen{generation}"
+            )
+            budget.spend(n_cost, _et_seg_name, "NEQ", f"generation_{generation}")
+            _early = run_early_truncating_nes_child_placement_v4(
+                generation=generation,
+                left_frontier=left_frontier,
+                right_frontier=right_frontier,
+                seg_name=_et_seg_name,
+                seg_root=out_root / "segments" / _et_seg_name,
+                profile=profile,
+                args=args,
+                ctx=ctx,
+                grid=grid,
+                out_root=out_root,
+                bin_path=bin_path,
+                beta_eff=beta_eff,
+                seed=seed + 100 + generation,
+            )
+            seg = _early["segment"]
+            left_design = _early["left_design"]
+            right_design = _early["right_design"]
+        else:
+            seg_name = f"seg_L{left_frontier.name}_R{right_frontier.name}_gen{generation}"
+            budget.spend(n_cost, seg_name, "NEQ", f"generation_{generation}")
+            seg = run_neq_segment_v4(
+                name=seg_name, left_boundary=left_frontier, right_boundary=right_frontier,
+                left_source=left_frontier, right_source=right_frontier,
+                bin_path=bin_path, ctx=ctx, t_neq=args.t_neq, n_neq_traj=args.n_neq_traj,
+                neq_nout=int(args.neq_nout), k_mid_scale=float(args.neq_k_mid_scale),
+                seed=seed + 100 + generation,
+                root=out_root / "segments" / seg_name,
+                k_min=float(args.k_min), k_max=float(args.k_max),
+            )
+            left_design = design_child_window(
+                current_window=left_frontier, opposite_window=right_frontier,
+                profile=profile, k_min=float(args.k_min), k_max=float(args.k_max),
+                beta_eff=beta_eff, target_kl=float(args.target_kl), direction="right",
+            )
+            right_design = design_child_window(
+                current_window=right_frontier, opposite_window=left_frontier,
+                profile=profile, k_min=float(args.k_min), k_max=float(args.k_max),
+                beta_eff=beta_eff, target_kl=float(args.target_kl), direction="left",
+            )
+
         segments.append(seg)
 
-        # Diagnostic MTS patch for the frontier segment
+        # Diagnostic MTS patch for the frontier segment (both modes)
         mts_patch = build_neq_mts_patch_v4(
             seg, grid, ctx, int(args.n_bootstrap_neq),
             out_root / "patches" / f"gen{generation}",
@@ -2387,16 +2934,16 @@ def main() -> None:
         if bool(seg.cft_summary.get("mts_solved", False)):
             seg.cft_summary["_mts_patch"] = mts_patch
 
-        # Design children
-        left_design = design_child_window(
-            current_window=left_frontier, opposite_window=right_frontier,
-            profile=profile, k_min=float(args.k_min), k_max=float(args.k_max),
-            beta_eff=beta_eff, target_kl=float(args.target_kl), direction="right",
+        # Augment designs with placement metadata for generation_summary.csv
+        for _d in [left_design, right_design]:
+            _d["nes_child_placement_mode"] = str(args.nes_child_placement_mode)
+            _d["prefix_n_time_used"] = _early.get("prefix_n_time_used", "") if _early else ""
+            _d["fraction_used"] = _early.get("fraction_used", "") if _early else ""
+        left_design["design_source"] = (
+            _early.get("left_design_source", "gt_fallback") if _early else "full"
         )
-        right_design = design_child_window(
-            current_window=right_frontier, opposite_window=left_frontier,
-            profile=profile, k_min=float(args.k_min), k_max=float(args.k_max),
-            beta_eff=beta_eff, target_kl=float(args.target_kl), direction="left",
+        right_design["design_source"] = (
+            _early.get("right_design_source", "gt_fallback") if _early else "full"
         )
 
         if not budget.can_spend(2 * eq_cost(args.n_eq_steps)):

@@ -11,6 +11,12 @@ TOTAL_BUDGET_STEPS="${TOTAL_BUDGET_STEPS:-5000000}"
 MAX_GENERATIONS="${MAX_GENERATIONS:-10}"
 MAX_REFINEMENT_ROUNDS="${MAX_REFINEMENT_ROUNDS:-10}"
 LABEL_PREFIX="${LABEL_PREFIX:-mines_variance_fusion_v4}"
+NES_CHILD_PLACEMENT_MODE="${NES_CHILD_PLACEMENT_MODE:-full}"
+NES_FRACTIONS="${NES_FRACTIONS:-10}"
+NES_FRONT_OVERLAP_Q_LOW="${NES_FRONT_OVERLAP_Q_LOW:-0.05}"
+NES_FRONT_OVERLAP_Q_HIGH="${NES_FRONT_OVERLAP_Q_HIGH:-0.95}"
+MTS_LOCAL_FIT_HALFWIDTH_SIGMA="${MTS_LOCAL_FIT_HALFWIDTH_SIGMA:-2.5}"
+MTS_LOCAL_FIT_MIN_POINTS="${MTS_LOCAL_FIT_MIN_POINTS:-5}"
 
 mkdir -p "${LOG_DIR}"
 
@@ -38,6 +44,12 @@ echo "[MiNES v4 sweep] MAX_GENERATIONS=${MAX_GENERATIONS}"
 echo "[MiNES v4 sweep] MAX_REFINEMENT_ROUNDS=${MAX_REFINEMENT_ROUNDS}"
 echo "[MiNES v4 sweep] NEQ_NOUT=${NEQ_NOUT}"
 echo "[MiNES v4 sweep] NEQ_K_MID_SCALE=${NEQ_K_MID_SCALE}"
+echo "[MiNES v4 sweep] NES_CHILD_PLACEMENT_MODE=${NES_CHILD_PLACEMENT_MODE}"
+echo "[MiNES v4 sweep] NES_FRACTIONS=${NES_FRACTIONS}"
+echo "[MiNES v4 sweep] NES_FRONT_OVERLAP_Q_LOW=${NES_FRONT_OVERLAP_Q_LOW}"
+echo "[MiNES v4 sweep] NES_FRONT_OVERLAP_Q_HIGH=${NES_FRONT_OVERLAP_Q_HIGH}"
+echo "[MiNES v4 sweep] MTS_LOCAL_FIT_HALFWIDTH_SIGMA=${MTS_LOCAL_FIT_HALFWIDTH_SIGMA}"
+echo "[MiNES v4 sweep] MTS_LOCAL_FIT_MIN_POINTS=${MTS_LOCAL_FIT_MIN_POINTS}"
 echo "[MiNES v4 sweep] LOG_DIR=${LOG_DIR}"
 
 run_mines () {
@@ -62,6 +74,12 @@ local t_neq="$1"
     --eq-overlap-threshold 0.3 \
     --final-refinement-mode eq-extend \
     --target-mbar-ddf 1e-3 \
+    --nes-child-placement-mode "${NES_CHILD_PLACEMENT_MODE}" \
+    --nes-fractions "${NES_FRACTIONS}" \
+    --nes-front-overlap-q-low "${NES_FRONT_OVERLAP_Q_LOW}" \
+    --nes-front-overlap-q-high "${NES_FRONT_OVERLAP_Q_HIGH}" \
+    --mts-local-fit-halfwidth-sigma "${MTS_LOCAL_FIT_HALFWIDTH_SIGMA}" \
+    --mts-local-fit-min-points "${MTS_LOCAL_FIT_MIN_POINTS}" \
     > "${LOG_FILE}" 2>&1
 
   echo "[MiNES v4] Finished t_neq=${t_neq}; log=${LOG_FILE}"
